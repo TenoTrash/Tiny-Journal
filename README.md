@@ -21,6 +21,15 @@ Generic Bluetooth Low Energy keyboards only (doesn't work with Apple Magic Keybo
 
 US and UK keyboard layouts only.
 
+Updates 2026.6.6:
+USB mass storage support added.
+Improved file structure.
+Bluetooth keyboard support expanded.
+Now opens last opened file.
+Expanded Google Drive support, now sending audio notes.
+Audio notes now cleaner.
+Cataracts mode now usable instead of just a joke.
+
 ## Features
 
 - Plain-text notes written directly on the Cardputer keyboard  
