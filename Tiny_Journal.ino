@@ -1,6 +1,8 @@
 #include <M5Cardputer.h>
 #include <SPI.h>
 #include <SD.h>
+#include "USB.h"
+#include "USBMSC.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -8,6 +10,53 @@
 #include <vector>
 #include <ctype.h>
 #include <time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+
+// Ring buffer for text/command events generated from HID reports.
+// This replaces the old single-byte char queue so Bluetooth keyboards can
+// emit text events and editor commands cleanly. It can also carry display-font
+// single-byte glyphs such as £.
+enum BtInputEventType : uint8_t {
+  BT_EVENT_NONE = 0,
+  BT_EVENT_TEXT,
+  BT_EVENT_COMMAND
+};
+
+enum BtEditorCommand : uint8_t {
+  BT_CMD_NONE = 0,
+  BT_CMD_BACKSPACE,
+  BT_CMD_ENTER,
+  BT_CMD_TAB,
+  BT_CMD_UP,
+  BT_CMD_DOWN,
+  BT_CMD_LEFT,
+  BT_CMD_RIGHT,
+  BT_CMD_DELETE_WORD_BACK,
+  BT_CMD_DELETE_WORD_FORWARD,
+  BT_CMD_WORD_LEFT,
+  BT_CMD_WORD_RIGHT,
+  BT_CMD_PAGE_UP,
+  BT_CMD_PAGE_DOWN,
+  BT_CMD_HOME,
+  BT_CMD_END,
+  BT_CMD_DOC_HOME,
+  BT_CMD_DOC_END,
+  BT_CMD_DELETE_FORWARD
+};
+
+struct BtInputEvent {
+  BtInputEventType type;
+  char text[5];       // UTF-8: max 4 bytes + NUL
+  uint8_t command;
+  uint8_t hidUsage;
+  uint8_t modifiers;
+};
+
+const int BT_INPUT_EVENT_QUEUE_SIZE = 64;
+volatile int btEventHead = 0;
+volatile int btEventTail = 0;
+BtInputEvent btEventQueue[BT_INPUT_EVENT_QUEUE_SIZE];
 
 
 // ---------- SD card pins for Cardputer (SPI mode) ----------
@@ -15,6 +64,14 @@
 #define SD_SPI_MISO_PIN 39
 #define SD_SPI_MOSI_PIN 14
 #define SD_SPI_CS_PIN 12
+
+// ---------- USB mass storage ----------
+// Requires Arduino IDE Tools -> USB Mode to be set to USB-OTG / TinyUSB on ESP32-S3.
+static const uint16_t USB_MSC_BLOCK_SIZE = 512;
+USBMSC *usbMsc = nullptr;
+bool usbMscConfigured = false;
+uint32_t usbMscBlockCount = 0;
+
 
 // ---------- Editor settings ----------
 static const int TAB_SIZE = 4;
@@ -67,8 +124,6 @@ enum MenuId {
 };
 
 
-
-
 MenuId currentMenu = MENU_NONE;
 int menuSelectedIndex = 0;
 int menuScrollOffset = 0;
@@ -80,7 +135,7 @@ size_t cursorIndex = 0;  // Position in textBuffer [0..length]
 int preferredCol = 0;  // Column we try to maintain when going up/down
 
 // Current file path for this document
-String currentFilePath = "/journal/journal.txt";
+String currentFilePath = "/journal/misc/note-boot.txt";
 
 // Visual line representation: [start, end) indices in textBuffer
 struct VisualLine {
@@ -102,6 +157,11 @@ int listVisibleLines = 0;
 int baseCharWidth = 0;
 int baseLineHeight = 0;
 
+// Cataracts mode used to choose the absolute largest possible text scale.
+// That can create one visual line per character and can exhaust RAM on longer notes.
+// Keep it very large, but bounded, so saved cataracts mode cannot boot-loop the device.
+static const int CATARACTS_TEXT_SCALE = 6;
+
 int firstVisibleLine = 0;  // Index into visualLines for top of screen
 
 bool bufferDirty = false;
@@ -109,13 +169,28 @@ unsigned long lastKeyPressTime = 0;  // For idle autosave
 bool savedAfterIdle = false;         // So we only save once per idle period
 bool needsRedraw = true;             // To avoid constant redraw/flicker
 
+// Track the last rendered screen so menus can avoid full-screen clears during simple cursor moves.
+AppMode lastRenderedAppMode = MODE_EDITOR;
+MenuId lastRenderedMenu = MENU_NONE;
+
 // Cursor anchoring mode: true = keep cursor ~2/3 down; false = classic behaviour
 bool cursorAnchored = true;
 
 // Idle autosave toggle (controlled from Editor behaviour menu)
 bool idleAutosaveEnabled = true;
 
-// Status message (for things like audio stub, sync messages, etc.)
+// ---------- Battery / power management ----------
+static const unsigned long BATTERY_POLL_INTERVAL_MS = 30000;  // poll every 30 seconds
+static const int LOW_BATTERY_LEVEL = 15;                      // autosave + warning
+static const int CRITICAL_BATTERY_LEVEL = 5;                  // autosave + urgent warning
+
+int batteryLevelPercent = -1;
+int batteryVoltageMv = -1;
+unsigned long lastBatteryPollMs = 0;
+bool lowBatteryWarningShown = false;
+bool criticalBatteryWarningShown = false;
+
+// Status message (for audio notes, sync messages, etc.)
 String statusMessage;
 unsigned long statusMessageUntil = 0;
 
@@ -185,9 +260,14 @@ struct DocumentEntry {
 std::vector<TemplateInfo> templates;
 
 // ---------- Wi-Fi & Google Drive sync ----------
-const char *WIFI_CFG_PATH = "/journal/wifi.cfg";
-const char *GDRIVE_CFG_PATH = "/journal/gdrive.cfg";
-const char *APPEARANCE_CFG_PATH = "/journal/theme.cfg";
+const char *WIFI_CFG_PATH = "/journal/config/wifi.cfg";
+const char *GDRIVE_CFG_PATH = "/journal/config/gdrive.cfg";
+const char *APPEARANCE_CFG_PATH = "/journal/config/theme.cfg";
+const char *BT_KEYBOARD_CFG_PATH = "/journal/config/btkeyboard.cfg";
+const char *RTC_CFG_PATH = "/journal/config/rtc.txt";
+const char *CONFIG_README_PATH = "/journal/config/CONFIG-README.txt";
+const char *LAST_FILE_PATH = "/journal/config/lastfile.txt";
+const char *USB_STORAGE_FLAG_PATH = "/journal/config/usb_storage_mode.flag";
 
 
 // Placeholder values for auto-generated config templates
@@ -230,8 +310,6 @@ int wifiScrollOffset = 0;
 String wifiPasswordInput;
 
 
-
-
 // ---------- RTC / Date-time ----------
 struct DateTime {
   int year;
@@ -256,6 +334,10 @@ void ensureJournalDirs();
 void ensureConfigTemplates();
 void ensureDefaultTemplates();
 void loadTemplates();
+void migrateLegacyRootJournalFile();
+bool isDocumentPathUsable(const String &path);
+void loadLastEditedFilePath();
+void saveLastEditedFilePath();
 
 void loadFromFile();
 void saveToFile();
@@ -271,6 +353,7 @@ void performLastAction();
 void setCursorAnchorMode(bool anchored);
 void applyEditorTheme(int themeIndex);
 void insertChar(char c);
+void insertText(const char *text);
 void insertNewline();
 void insertTab();
 void backspaceChar();
@@ -324,6 +407,8 @@ bool connectWiFi();
 void disconnectWiFi();
 bool loadGDriveConfigFromSD();
 bool getGoogleAccessToken(String &accessToken);
+String jsonEscape(const String &value);
+bool uploadFileToDriveMultipart(const String &accessToken, const String &path, const String &mimeType, bool showResultMessage);
 bool syncGoogleDrive();
 void runManualSync();
 void saveWiFiConfig(const String &ssid, const String &password);
@@ -341,6 +426,9 @@ void handleWiFiSetupKeys(const Keyboard_Class::KeysState &ks);
 void drawWiFiSetup();
 
 // Bluetooth keyboard setup UI
+void loadBluetoothKeyboardConfigFromSD();
+void saveBluetoothKeyboardConfigToSD();
+void forgetBluetoothKeyboardConfig();
 void openBluetoothKeyboardSetup();
 void handleBluetoothKeyboardSetupKeys(const Keyboard_Class::KeysState &ks);
 void drawBluetoothKeyboardSetup();
@@ -348,6 +436,12 @@ void drawBluetoothKeyboardSetup();
 // RTC
 void initRTC();
 void updateRTC();
+
+// Battery / power management
+void initPowerManagement();
+void updateBatteryStatus(bool force = false);
+String getBatteryStatusString();
+void handleLowBattery();
 void loadRTCFromSD();
 void saveRTCToSD();
 void advanceDateTime(unsigned long secs);
@@ -355,7 +449,7 @@ int daysInMonth(int year, int month);
 bool isLeapYear(int year);
 
 // Audio & document tools
-void startAudioNoteStub();
+void startAudioNote();
 void startAudioNoteBrowser();
 void openDocumentBrowser();
 
@@ -372,7 +466,9 @@ void showStatusMessage(const String &msg, unsigned long durationMs);
 void initBluetoothKeyboard();
 void handleBluetoothInput();
 void btKeyboardStartScan();
+bool btKeyboardConnect();
 void btKeyboardDisconnect();
+void btProcessHidReports();
 
 // Date-time menu helpers
 void openDateTimeEditor();
@@ -383,25 +479,47 @@ void drawDateTimeEditor();
 void handleAboutScreenKeys(const Keyboard_Class::KeysState &ks);
 void drawAboutScreen();
 
+// USB mass storage
+void initUsbStorageDevice(bool presentOnStart);
+void enterUsbStorageMode();
+void runUsbStorageBootMode();
+void drawUsbStorageModeScreen();
+static int32_t usbMscRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize);
+static int32_t usbMscWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize);
+static bool usbMscStartStop(uint8_t power_condition, bool start, bool load_eject);
+
+
 // ---------- Setup ----------
 
 void setup() {
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);  // enableKeyboard = true
+  initPowerManagement();
 
   initDisplay();
   initSD();
-  ensureJournalDirs();  // also creates config templates + README
+  ensureJournalDirs();
+
+  // USB storage mode must be entered by rebooting into a dedicated mode so the host sees
+  // the mass-storage interface during USB enumeration. Do this before normal app startup.
+  if (SD.exists(USB_STORAGE_FLAG_PATH)) {
+    runUsbStorageBootMode();
+  }
   loadWifiConfigFromSD();
   loadAppearanceFromSD();  // <-- load saved theme, if any
   ensureDefaultTemplates();
   loadTemplates();
   initRTC();
   initBluetoothKeyboard();  // set up BLE stack for external keyboard (disabled by default)
+  loadLastEditedFilePath();
 
-  // Load default document if it exists
-  loadFromFile();
-
+  // Load the last edited/default document if it exists. On a fresh SD card, behave like
+  // "New blank note" and create the first note in /journal/misc rather than /journal root.
+  if (SD.exists(currentFilePath.c_str())) {
+    loadFromFile();
+  } else {
+    createNewBlankNote();
+  }
 
   cursorIndex = textBuffer.length();  // start at end of file
   rebuildLayout();
@@ -417,11 +535,12 @@ void setup() {
 void loop() {
   updateRTC();
   M5Cardputer.update();
+  updateBatteryStatus();
+  handleLowBattery();
   handleKeyboard();
   handleBluetoothInput();  // process queued chars from BT keyboard
   handleKeyRepeat();       // built-in keyboard repeat
   handleBtKeyRepeat();     // Bluetooth keyboard repeat
-
 
 
   unsigned long now = millis();
@@ -431,7 +550,6 @@ void loop() {
     savedAfterIdle = true;
     needsRedraw = true;
   }
-
 
 
   if (needsRedraw) {
@@ -493,12 +611,20 @@ void applyEditorFontSize() {
   int screenH = M5Cardputer.Display.height();
 
   if (editorFontSizeIndex == 2) {
-    // Cataracts mode: logically 1 column, 1 visible line in the editor.
-    // Menus/Wi-Fi use listVisibleLines instead, so they stay normal.
-    maxCols = 1;
-    visibleLines = 1;
+    // Cataracts mode: huge editor text, but bounded so wrapping does not create
+    // one visual line per character on longer documents. It deliberately uses
+    // a simple two-line viewport so text wraps while writing.
+    int charWidth = baseCharWidth * CATARACTS_TEXT_SCALE;
+    int editorLineH = baseLineHeight * CATARACTS_TEXT_SCALE;
+    if (charWidth < 1) charWidth = 1;
+    if (editorLineH < 1) editorLineH = 1;
+
+    maxCols = screenW / charWidth;
     if (maxCols < 1) maxCols = 1;
+
+    visibleLines = (screenH - topBarHeight) / editorLineH;
     if (visibleLines < 1) visibleLines = 1;
+    if (visibleLines > 2) visibleLines = 2;
     return;
   }
 
@@ -519,6 +645,90 @@ void applyEditorFontSize() {
 }
 
 
+void initPowerManagement() {
+  // Keep the original battery-management behaviour. The audio issue was traced to
+  // M5Stack board package 3.3.x; with board package 3.2.2 the mic works normally.
+  M5Cardputer.Power.setBatteryCharge(true);
+  updateBatteryStatus(true);
+}
+
+void updateBatteryStatus(bool force) {
+  unsigned long now = millis();
+
+  if (!force && (now - lastBatteryPollMs) < BATTERY_POLL_INTERVAL_MS) {
+    return;
+  }
+
+  lastBatteryPollMs = now;
+
+  int oldLevel = batteryLevelPercent;
+
+  batteryLevelPercent = M5Cardputer.Power.getBatteryLevel();
+  batteryVoltageMv = M5Cardputer.Power.getBatteryVoltage();
+
+  if (batteryLevelPercent < 0) batteryLevelPercent = -1;
+  if (batteryLevelPercent > 100) batteryLevelPercent = 100;
+
+  // Refresh the editor top bar if the visible battery value changed.
+  if (oldLevel != batteryLevelPercent && appMode == MODE_EDITOR) {
+    needsRedraw = true;
+  }
+}
+
+String getBatteryStatusString() {
+  if (batteryLevelPercent < 0) {
+    return "bat:?";
+  }
+
+  String s = "bat:";
+  s += String(batteryLevelPercent);
+  s += "%";
+
+  if (batteryLevelPercent <= LOW_BATTERY_LEVEL) {
+    s += "!";
+  }
+
+  return s;
+}
+
+void handleLowBattery() {
+  if (batteryLevelPercent < 0) {
+    return;
+  }
+
+  if (batteryLevelPercent <= CRITICAL_BATTERY_LEVEL && !criticalBatteryWarningShown) {
+    if (bufferDirty) {
+      saveToFile();
+      bufferDirty = false;
+      savedAfterIdle = true;
+    }
+
+    showStatusMessage("Critical battery - saved note", 4000);
+    criticalBatteryWarningShown = true;
+    lowBatteryWarningShown = true;
+    needsRedraw = true;
+    return;
+  }
+
+  if (batteryLevelPercent <= LOW_BATTERY_LEVEL && !lowBatteryWarningShown) {
+    if (bufferDirty) {
+      saveToFile();
+      bufferDirty = false;
+      savedAfterIdle = true;
+    }
+
+    showStatusMessage("Low battery - saved note", 3000);
+    lowBatteryWarningShown = true;
+    needsRedraw = true;
+  }
+
+  if (batteryLevelPercent > LOW_BATTERY_LEVEL) {
+    lowBatteryWarningShown = false;
+    criticalBatteryWarningShown = false;
+  }
+}
+
+
 void initSD() {
   SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN);
   if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
@@ -536,6 +746,7 @@ void ensureJournalDirs() {
   }
 
   if (!SD.exists("/journal")) SD.mkdir("/journal");
+  if (!SD.exists("/journal/config")) SD.mkdir("/journal/config");
   if (!SD.exists("/journal/templates")) SD.mkdir("/journal/templates");
   if (!SD.exists("/journal/daily")) SD.mkdir("/journal/daily");
   if (!SD.exists("/journal/notes")) SD.mkdir("/journal/notes");
@@ -551,8 +762,122 @@ void ensureJournalDirs() {
   ensureConfigTemplates();
 }
 
-// Create wifi.cfg, gdrive.cfg, and CONFIG-README.txt if missing
+// Move legacy root-level config files into /journal/config so old SD cards keep working.
+void migrateConfigFileIfNeeded(const char *oldPath, const char *newPath) {
+  if (SD.exists(newPath)) return;
+  if (!SD.exists(oldPath)) return;
+
+  File oldFile = SD.open(oldPath, FILE_READ);
+  if (!oldFile) return;
+
+  File newFile = SD.open(newPath, FILE_WRITE);
+  if (!newFile) {
+    oldFile.close();
+    return;
+  }
+
+  while (oldFile.available()) {
+    newFile.write((uint8_t)oldFile.read());
+  }
+
+  oldFile.close();
+  newFile.close();
+  SD.remove(oldPath);
+}
+
+// Move the original root-level first note into /journal/misc for a tidy journal root.
+void migrateLegacyRootJournalFile() {
+  const char *oldPath = "/journal/journal.txt";
+  if (!SD.exists(oldPath)) return;
+  if (!SD.exists("/journal/misc")) SD.mkdir("/journal/misc");
+
+  String newPath = "/journal/misc/journal.txt";
+  if (SD.exists(newPath.c_str())) {
+    int suffix = 1;
+    do {
+      newPath = "/journal/misc/journal-" + String(suffix) + ".txt";
+      suffix++;
+    } while (SD.exists(newPath.c_str()) && suffix < 1000);
+  }
+
+  File oldFile = SD.open(oldPath, FILE_READ);
+  if (!oldFile) return;
+
+  File newFile = SD.open(newPath.c_str(), FILE_WRITE);
+  if (!newFile) {
+    oldFile.close();
+    return;
+  }
+
+  while (oldFile.available()) {
+    newFile.write((uint8_t)oldFile.read());
+  }
+
+  oldFile.close();
+  newFile.close();
+  SD.remove(oldPath);
+
+  // If this was the saved last-edited document, point the app at its new home.
+  if (currentFilePath == oldPath) {
+    currentFilePath = newPath;
+    saveLastEditedFilePath();
+  }
+}
+
+// Only accept document paths inside real journal document folders, not config/templates/root.
+bool isDocumentPathUsable(const String &path) {
+  if (path.length() == 0) return false;
+  if (!path.startsWith("/journal/")) return false;
+  if (!path.endsWith(".txt")) return false;
+  if (path.startsWith("/journal/config/")) return false;
+  if (path.startsWith("/journal/templates/")) return false;
+  if (path.startsWith("/journal/audio/")) return false;
+  if (path == "/journal/journal.txt") return false;
+  return SD.exists(path.c_str());
+}
+
+void loadLastEditedFilePath() {
+  if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) return;
+  if (!SD.exists(LAST_FILE_PATH)) return;
+
+  File f = SD.open(LAST_FILE_PATH, FILE_READ);
+  if (!f) return;
+
+  String path = f.readStringUntil('\n');
+  f.close();
+  path.trim();
+
+  if (isDocumentPathUsable(path)) {
+    currentFilePath = path;
+  }
+}
+
+void saveLastEditedFilePath() {
+  if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) return;
+  if (!currentFilePath.startsWith("/journal/")) return;
+  if (currentFilePath.startsWith("/journal/config/")) return;
+  if (currentFilePath.startsWith("/journal/templates/")) return;
+
+  SD.remove(LAST_FILE_PATH);
+  File f = SD.open(LAST_FILE_PATH, FILE_WRITE);
+  if (!f) return;
+  f.println(currentFilePath);
+  f.close();
+}
+
+// Create config files and CONFIG-README.txt if missing
 void ensureConfigTemplates() {
+  if (!SD.exists("/journal/config")) SD.mkdir("/journal/config");
+
+  migrateConfigFileIfNeeded("/journal/wifi.cfg", WIFI_CFG_PATH);
+  migrateConfigFileIfNeeded("/journal/gdrive.cfg", GDRIVE_CFG_PATH);
+  migrateConfigFileIfNeeded("/journal/theme.cfg", APPEARANCE_CFG_PATH);
+  migrateConfigFileIfNeeded("/journal/btkeyboard.cfg", BT_KEYBOARD_CFG_PATH);
+  migrateConfigFileIfNeeded("/journal/rtc.txt", RTC_CFG_PATH);
+  migrateConfigFileIfNeeded("/journal/CONFIG-README.txt", CONFIG_README_PATH);
+  migrateConfigFileIfNeeded("/journal/lastfile.txt", LAST_FILE_PATH);
+  migrateLegacyRootJournalFile();
+
   // wifi.cfg template
   if (!SD.exists(WIFI_CFG_PATH)) {
     File f = SD.open(WIFI_CFG_PATH, FILE_WRITE);
@@ -576,16 +901,16 @@ void ensureConfigTemplates() {
   }
 
   // CONFIG-README.txt with basic instructions
-  if (!SD.exists("/journal/CONFIG-README.txt")) {
-    File f = SD.open("/journal/CONFIG-README.txt", FILE_WRITE);
+  if (!SD.exists(CONFIG_README_PATH)) {
+    File f = SD.open(CONFIG_README_PATH, FILE_WRITE);
     if (f) {
       f.println("Cardputer Journal configuration");
       f.println("--------------------------------");
       f.println();
-      f.println("This folder contains config files for WiFi and Google Drive.");
+      f.println("This folder contains Tiny Journal config files.");
       f.println();
       f.println("1) WiFi config: wifi.cfg");
-      f.println("   Path: /journal/wifi.cfg");
+      f.println("   Path: /journal/config/wifi.cfg");
       f.println("   Format: two lines:");
       f.println("     Line 1: WiFi SSID");
       f.println("     Line 2: WiFi password");
@@ -603,7 +928,7 @@ void ensureConfigTemplates() {
       f.println("     Fn + `  -> Settings -> Sync & connectivity -> WiFi setup");
       f.println();
       f.println("2) Google Drive config: gdrive.cfg");
-      f.println("   Path: /journal/gdrive.cfg");
+      f.println("   Path: /journal/config/gdrive.cfg");
       f.println("   Format: four lines:");
       f.println("     Line 1: refresh_token");
       f.println("     Line 2: client_id");
@@ -642,7 +967,6 @@ const char *TEMPLATE_DAILY =
 {{DATE_LONG}}
 
 
-
 )";
 
 const char *TEMPLATE_QUICK =
@@ -651,7 +975,6 @@ const char *TEMPLATE_QUICK =
 #@filename: note-{{DATE}}-{{TIME}}.txt
 
 {{DATE}} {{TIME}}
-
 
 
 )";
@@ -783,8 +1106,9 @@ void saveToFile() {
   }
   f.close();
 
-  // Also persist current RTC time whenever we save
+  // Also persist current RTC time and current document path whenever we save
   saveRTCToSD();
+  saveLastEditedFilePath();
 }
 
 // ---------- Template parsing & instantiation ----------
@@ -944,7 +1268,6 @@ void createDocumentFromTemplateIndex(int idx) {
   }
 
 
-
   File f = SD.open(info.filePath.c_str(), FILE_READ);
   if (!f) return;
 
@@ -972,6 +1295,7 @@ void createDocumentFromTemplateIndex(int idx) {
   body = expandTemplateTokens(body);
 
   currentFilePath = path;
+  saveLastEditedFilePath();
   textBuffer = body;
   cursorIndex = textBuffer.length();
   bufferDirty = true;
@@ -1003,6 +1327,7 @@ void createNewBlankNote() {
   String path = dir + "/" + filename;
 
   currentFilePath = path;
+  saveLastEditedFilePath();
   textBuffer = "";
   cursorIndex = 0;
   bufferDirty = true;
@@ -1026,6 +1351,7 @@ void createNewDailyEntry() {
     String filename = "daily-" + String(t) + ".txt";
     String path = dir + "/" + filename;
     currentFilePath = path;
+    saveLastEditedFilePath();
     textBuffer = "";
     cursorIndex = 0;
     bufferDirty = true;
@@ -1071,13 +1397,13 @@ void loadRTCFromSD() {
     return;
   }
 
-  if (!SD.exists("/journal/rtc.txt")) {
+  if (!SD.exists(RTC_CFG_PATH)) {
     rtcInitialised = true;  // start from default
     rtcLastMillis = millis();
     return;
   }
 
-  File f = SD.open("/journal/rtc.txt", FILE_READ);
+  File f = SD.open(RTC_CFG_PATH, FILE_READ);
   if (!f) {
     rtcInitialised = true;
     rtcLastMillis = millis();
@@ -1127,8 +1453,8 @@ void saveRTCToSD() {
     return;
   }
 
-  SD.remove("/journal/rtc.txt");
-  File f = SD.open("/journal/rtc.txt", FILE_WRITE);
+  SD.remove(RTC_CFG_PATH);
+  File f = SD.open(RTC_CFG_PATH, FILE_WRITE);
   if (!f) return;
 
   String line = String(gDateTime.year) + "-" + twoDigits(gDateTime.month) + "-" + twoDigits(gDateTime.day) + " " + twoDigits(gDateTime.hour) + ":" + twoDigits(gDateTime.minute) + ":" + twoDigits(gDateTime.second);
@@ -1315,8 +1641,7 @@ void saveAppearanceToSD() {
 }
 
 
-
-// Load /journal/gdrive.cfg (refresh_token, client_id, client_secret, folder_id)
+// Load /journal/config/gdrive.cfg (refresh_token, client_id, client_secret, folder_id)
 bool loadGDriveConfigFromSD() {
   gdriveRefreshToken = "";
   gdriveClientId = "";
@@ -1422,86 +1747,142 @@ bool getGoogleAccessToken(String &accessToken) {
   return true;
 }
 
-bool uploadCurrentFileToDrive(const String &accessToken) {
-  // Make sure SD is available
+
+String jsonEscape(const String &value) {
+  String out;
+  out.reserve(value.length() + 8);
+
+  for (size_t i = 0; i < value.length(); ++i) {
+    char c = value[i];
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\r') {
+      out += "\\r";
+    } else if (c == '\t') {
+      out += "\\t";
+    } else {
+      out += c;
+    }
+  }
+
+  return out;
+}
+
+bool uploadFileToDriveMultipart(const String &accessToken, const String &path, const String &mimeType, bool showResultMessage) {
   if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
-    showStatusMessage("Upload: SD error", 3000);
+    if (showResultMessage) showStatusMessage("Upload: SD error", 3000);
     return false;
   }
 
-  // Make sure we have something to upload
-  if (!SD.exists(currentFilePath.c_str())) {
-    showStatusMessage("Upload: file missing", 3000);
+  if (!SD.exists(path.c_str())) {
+    if (showResultMessage) showStatusMessage("Upload: file missing", 3000);
     return false;
   }
 
-  // Read the current document into a string
-  File f = SD.open(currentFilePath.c_str(), FILE_READ);
+  File f = SD.open(path.c_str(), FILE_READ);
   if (!f) {
-    showStatusMessage("Upload: open failed", 3000);
+    if (showResultMessage) showStatusMessage("Upload: open failed", 3000);
     return false;
   }
 
-  String fileContent;
-  while (f.available()) {
-    fileContent += (char)f.read();
-  }
-  f.close();
-
-  // Derive a simple filename from the SD path
-  String filename = currentFilePath;
+  String filename = path;
   int slashPos = filename.lastIndexOf('/');
   if (slashPos >= 0 && slashPos < (int)filename.length() - 1) {
     filename = filename.substring(slashPos + 1);
   }
 
-  // Build metadata JSON
-  String meta = "{\"name\":\"" + filename + "\"";
+  String boundary = "----cardputer_journal_boundary";
+  String meta = "{\"name\":\"" + jsonEscape(filename) + "\"";
   if (gdriveFolderId.length() > 0) {
-    meta += ",\"parents\":[\"" + gdriveFolderId + "\"]";
+    meta += ",\"parents\":[\"" + jsonEscape(gdriveFolderId) + "\"]";
   }
   meta += "}";
 
-  // Build multipart body
-  String boundary = "----cardputer_journal_boundary";
-  String body;
+  String bodyStart;
+  bodyStart += "--" + boundary + "\r\n";
+  bodyStart += "Content-Type: application/json; charset=UTF-8\r\n\r\n";
+  bodyStart += meta + "\r\n";
+  bodyStart += "--" + boundary + "\r\n";
+  bodyStart += "Content-Type: " + mimeType + "\r\n\r\n";
 
-  body += "--" + boundary + "\r\n";
-  body += "Content-Type: application/json; charset=UTF-8\r\n\r\n";
-  body += meta + "\r\n";
+  String bodyEnd = "\r\n--" + boundary + "--\r\n";
 
-  body += "--" + boundary + "\r\n";
-  body += "Content-Type: text/plain\r\n\r\n";
-  body += fileContent + "\r\n";
+  uint32_t fileSize = f.size();
+  uint32_t contentLength = bodyStart.length() + fileSize + bodyEnd.length();
 
-  body += "--" + boundary + "--\r\n";
-
-  // Send upload request
   WiFiClientSecure client;
   client.setInsecure();
 
-  HTTPClient https;
-  const char *url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart";
-
-  if (!https.begin(client, url)) {
-    showStatusMessage("Upload: begin failed", 3000);
+  if (!client.connect("www.googleapis.com", 443)) {
+    f.close();
+    if (showResultMessage) showStatusMessage("Upload: connect failed", 3000);
     return false;
   }
 
-  https.addHeader("Authorization", "Bearer " + accessToken);
-  https.addHeader("Content-Type", "multipart/related; boundary=" + boundary);
+  client.print("POST /upload/drive/v3/files?uploadType=multipart HTTP/1.1\r\n");
+  client.print("Host: www.googleapis.com\r\n");
+  client.print("Authorization: Bearer ");
+  client.print(accessToken);
+  client.print("\r\n");
+  client.print("Content-Type: multipart/related; boundary=");
+  client.print(boundary);
+  client.print("\r\n");
+  client.print("Content-Length: ");
+  client.print(contentLength);
+  client.print("\r\n");
+  client.print("Connection: close\r\n\r\n");
 
-  int httpCode = https.POST((uint8_t *)body.c_str(), body.length());
-  String resp = https.getString();
-  https.end();
+  client.print(bodyStart);
+
+  uint8_t buf[1024];
+  while (f.available()) {
+    size_t n = f.read(buf, sizeof(buf));
+    if (n == 0) break;
+    client.write(buf, n);
+    delay(0);
+  }
+  f.close();
+
+  client.print(bodyEnd);
+
+  unsigned long startWait = millis();
+  while (client.connected() && !client.available() && millis() - startWait < 10000) {
+    delay(10);
+  }
+
+  String statusLine = client.readStringUntil('\n');
+  statusLine.trim();
+
+  int httpCode = 0;
+  int firstSpace = statusLine.indexOf(' ');
+  if (firstSpace >= 0 && firstSpace + 4 <= (int)statusLine.length()) {
+    httpCode = statusLine.substring(firstSpace + 1, firstSpace + 4).toInt();
+  }
+
+  // Drain a little of the response so TLS/socket cleanup is tidy, but don't waste RAM storing it.
+  unsigned long drainStart = millis();
+  while ((client.connected() || client.available()) && millis() - drainStart < 3000) {
+    while (client.available()) {
+      client.read();
+    }
+    delay(1);
+  }
+  client.stop();
 
   if (httpCode == 200 || httpCode == 201) {
-    showStatusMessage("Uploaded " + filename, 3000);
+    if (showResultMessage) showStatusMessage("Uploaded " + filename, 3000);
     return true;
-  } else {
-    showStatusMessage("Upload err " + String(httpCode), 3000);
-    return false;
   }
+
+  if (showResultMessage) showStatusMessage("Upload err " + String(httpCode), 3000);
+  return false;
+}
+
+bool uploadCurrentFileToDrive(const String &accessToken) {
+  return uploadFileToDriveMultipart(accessToken, currentFilePath, "text/plain; charset=UTF-8", true);
 }
 
 // Upload all .txt docs in a given directory (non-recursive)
@@ -1531,14 +1912,49 @@ static void syncDocsInDir(const char *dirPath, const String &accessToken, bool &
         if (!fullPath.endsWith("/")) fullPath += "/";
         fullPath += name;
 
-        // Use the same upload routine as everywhere else
-        currentFilePath = fullPath;
-        if (!uploadCurrentFileToDrive(accessToken)) {
+        if (!uploadFileToDriveMultipart(accessToken, fullPath, "text/plain; charset=UTF-8", true)) {
           allOk = false;
         }
 
         docCount++;
         // Give WiFi / TLS stack a moment
+        delay(10);
+      }
+    }
+
+    f.close();
+  }
+
+  dir.close();
+}
+
+// Upload all .wav audio notes in a given directory (non-recursive)
+static void syncAudioInDir(const char *dirPath, const String &accessToken, bool &allOk, int &audioCount) {
+  File dir = SD.open(dirPath);
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    return;
+  }
+
+  while (true) {
+    File f = dir.openNextFile();
+    if (!f) break;
+
+    if (!f.isDirectory()) {
+      String name = String(f.name());
+      String lower = name;
+      lower.toLowerCase();
+
+      if (lower.endsWith(".wav")) {
+        String fullPath = String(dirPath);
+        if (!fullPath.endsWith("/")) fullPath += "/";
+        fullPath += name;
+
+        if (!uploadFileToDriveMultipart(accessToken, fullPath, "audio/wav", true)) {
+          allOk = false;
+        }
+
+        audioCount++;
         delay(10);
       }
     }
@@ -1569,8 +1985,8 @@ bool syncGoogleDrive() {
 
   bool allOk = true;
   int docCount = 0;
+  int audioCount = 0;
 
-  syncDocsInDir("/journal", accessToken, allOk, docCount);
   syncDocsInDir("/journal/daily", accessToken, allOk, docCount);
   syncDocsInDir("/journal/notes", accessToken, allOk, docCount);
   syncDocsInDir("/journal/meetings", accessToken, allOk, docCount);
@@ -1578,19 +1994,18 @@ bool syncGoogleDrive() {
   syncDocsInDir("/journal/travel", accessToken, allOk, docCount);
   syncDocsInDir("/journal/misc", accessToken, allOk, docCount);
   syncDocsInDir("/journal/archive", accessToken, allOk, docCount);
+  syncAudioInDir("/journal/audio", accessToken, allOk, audioCount);
 
   // Restore editor state path
   currentFilePath = originalPath;
 
-  if (docCount == 0) {
-    showStatusMessage("No documents to sync", 2000);
+  if (docCount == 0 && audioCount == 0) {
+    showStatusMessage("No files to sync", 2000);
     return true;  // nothing to do, but not an error
   }
 
   return allOk;
 }
-
-
 
 
 void runManualSync() {
@@ -1663,7 +2078,15 @@ void runTimeSync() {
 bool btKeyboardEnabled = false;
 bool btKeyboardConnected = false;
 String btKeyboardName = "";
+String btKeyboardAddress = "";
+String btKeyboardSavedAddress = "";
+String btKeyboardSavedName = "";
+bool btKeyboardConfigLoaded = false;
 String btKeyboardLastError = "";
+
+// BLE state shown on the Bluetooth keyboard setup screen.
+static bool btInitDone = false;
+String btAuthDebug = "";
 
 // Simple state for the Bluetooth keyboard setup UI
 enum BtSetupState {
@@ -1684,6 +2107,73 @@ enum BtKeyboardLayout {
 BtKeyboardLayout btKeyboardLayout = BT_LAYOUT_UK;
 
 
+void loadBluetoothKeyboardConfigFromSD() {
+  if (btKeyboardConfigLoaded) return;
+  btKeyboardConfigLoaded = true;
+
+  btKeyboardSavedAddress = "";
+  btKeyboardSavedName = "";
+
+  if (!SD.exists(BT_KEYBOARD_CFG_PATH)) {
+    return;
+  }
+
+  File f = SD.open(BT_KEYBOARD_CFG_PATH, FILE_READ);
+  if (!f) return;
+
+  // Line 1: saved keyboard BLE address
+  btKeyboardSavedAddress = f.readStringUntil('\n');
+  btKeyboardSavedAddress.trim();
+
+  // Line 2: saved keyboard name
+  btKeyboardSavedName = f.readStringUntil('\n');
+  btKeyboardSavedName.trim();
+
+  // Line 3: layout index
+  String layoutLine = f.readStringUntil('\n');
+  layoutLine.trim();
+
+  f.close();
+
+  if (layoutLine.length() > 0) {
+    int layoutIdx = layoutLine.toInt();
+    if (layoutIdx == BT_LAYOUT_US || layoutIdx == BT_LAYOUT_UK) {
+      btKeyboardLayout = (BtKeyboardLayout)layoutIdx;
+    }
+  }
+}
+
+void saveBluetoothKeyboardConfigToSD() {
+  SD.remove(BT_KEYBOARD_CFG_PATH);
+  File f = SD.open(BT_KEYBOARD_CFG_PATH, FILE_WRITE);
+  if (!f) return;
+
+  f.println(btKeyboardSavedAddress);
+  f.println(btKeyboardSavedName);
+  f.println((int)btKeyboardLayout);
+  f.close();
+}
+
+void forgetBluetoothKeyboardConfig() {
+  // Forget Tiny Journal's saved keyboard preference.
+  btKeyboardSavedAddress = "";
+  btKeyboardSavedName = "";
+  btKeyboardAddress = "";
+  SD.remove(BT_KEYBOARD_CFG_PATH);
+
+  // Also clear the ESP32/NimBLE bond store. This is deliberately all-bonds
+  // rather than address-specific: some keyboards use resolvable/random BLE
+  // addresses, so a saved text address may not match the stored bond exactly.
+  if (btInitDone || NimBLEDevice::isInitialized()) {
+    int bondCount = NimBLEDevice::getNumBonds();
+    bool ok = NimBLEDevice::deleteAllBonds();
+    btAuthDebug = ok ? ("bonds cleared " + String(bondCount)) : "bond clear failed";
+  } else {
+    btAuthDebug = "keyboard forgotten";
+  }
+}
+
+
 // List of devices found in the last scan for display
 const int BT_MAX_SCAN_DEVICES = 10;
 int btScanDeviceCount = 0;
@@ -1695,387 +2185,476 @@ bool btScanDeviceIsHid[BT_MAX_SCAN_DEVICES];
 static NimBLEAdvertisedDevice *btKeyboardAdvDevice = nullptr;
 static NimBLEClient *btKeyboardClient = nullptr;
 static NimBLERemoteCharacteristic *btKeyboardReportChar = nullptr;
-static bool btInitDone = false;
-
 // Debug counters / status
 volatile uint32_t btReportCount = 0;  // how many HID notifications we've seen
-String btAuthDebug = "";              // security / auth status text
 
 
+// BLE HID report queue.
+// The notification callback must stay tiny: it copies the incoming report
+// into this queue and returns. The main loop does the decoding safely.
+struct BtHidReport {
+  uint8_t data[8];
+  uint8_t length;
+};
 
-// Last 8-byte HID report so we can detect newly-pressed keys
+static const int BT_HID_REPORT_QUEUE_SIZE = 16;
+static QueueHandle_t btHidReportQueue = nullptr;
+volatile uint32_t btDroppedReportCount = 0;
+uint8_t btSubscribedReportCount = 0;
+String btReportDebug = "";
+// Last normalised HID report so we can detect newly-pressed keys.
+// Normalised format used by Tiny Journal:
+//   [0]    = modifiers
+//   [1..6] = up to 6 key usages
+//   [7]    = unused
 static uint8_t btLastReport[8] = { 0 };
+
+// True when subscribed to Boot Keyboard Input Report 0x2A22.
+// False when subscribed to standard HID Report characteristic 0x2A4D.
+static bool btUsingBootReport = false;
 
 // Simple tracking for BT key repeat
 bool btAnyKeyDown = false;
 unsigned long btKeyPressStartTime = 0;
 unsigned long btLastKeyActionTime = 0;
 bool btKeyHeld = false;
+bool btRepeatEligible = false;
 
-// Simple ring buffer for characters generated from HID reports
-const int BT_KEY_QUEUE_SIZE = 64;
-volatile int btKeyHead = 0;
-volatile int btKeyTail = 0;
-char btKeyQueue[BT_KEY_QUEUE_SIZE];
-
-
-
-// Push a character into the queue (drop if full)
-void btQueuePushChar(char c) {
-  int next = (btKeyHead + 1) % BT_KEY_QUEUE_SIZE;
-  if (next == btKeyTail) {
-    // queue full, drop character
-    return;
-  }
-  btKeyQueue[btKeyHead] = c;
-  btKeyHead = next;
+void btClearInputEventQueue() {
+  btEventHead = 0;
+  btEventTail = 0;
 }
 
-// Pop a character from the queue, returns false if empty
-bool btQueuePopChar(char &c) {
-  if (btKeyHead == btKeyTail) {
+bool btQueuePushEvent(const BtInputEvent &event) {
+  int next = (btEventHead + 1) % BT_INPUT_EVENT_QUEUE_SIZE;
+  if (next == btEventTail) {
+    // queue full, drop event
     return false;
   }
-  c = btKeyQueue[btKeyTail];
-  btKeyTail = (btKeyTail + 1) % BT_KEY_QUEUE_SIZE;
+
+  btEventQueue[btEventHead] = event;
+  btEventHead = next;
+  return true;
+}
+
+bool btQueuePopEvent(BtInputEvent &event) {
+  if (btEventHead == btEventTail) {
+    return false;
+  }
+
+  event = btEventQueue[btEventTail];
+  btEventTail = (btEventTail + 1) % BT_INPUT_EVENT_QUEUE_SIZE;
+  return true;
+}
+
+void btMakeEmptyEvent(BtInputEvent &event, uint8_t key, uint8_t mods) {
+  event.type = BT_EVENT_NONE;
+  event.text[0] = '\0';
+  event.command = BT_CMD_NONE;
+  event.hidUsage = key;
+  event.modifiers = mods;
+}
+
+bool btSetTextEvent(BtInputEvent &event, const char *textValue) {
+  if (!textValue || textValue[0] == '\0') {
+    return false;
+  }
+
+  event.type = BT_EVENT_TEXT;
+  event.command = BT_CMD_NONE;
+  strncpy(event.text, textValue, sizeof(event.text) - 1);
+  event.text[sizeof(event.text) - 1] = '\0';
+  return true;
+}
+
+bool btSetTextCharEvent(BtInputEvent &event, char c) {
+  if (c == 0) return false;
+
+  event.type = BT_EVENT_TEXT;
+  event.command = BT_CMD_NONE;
+  event.text[0] = c;
+  event.text[1] = '\0';
+  return true;
+}
+
+bool btSetTextByteEvent(BtInputEvent &event, uint8_t value) {
+  if (value == 0) return false;
+
+  event.type = BT_EVENT_TEXT;
+  event.command = BT_CMD_NONE;
+  event.text[0] = (char)value;
+  event.text[1] = '\0';
+  return true;
+}
+
+bool btSetCommandEvent(BtInputEvent &event, BtEditorCommand command) {
+  if (command == BT_CMD_NONE) {
+    return false;
+  }
+
+  event.type = BT_EVENT_COMMAND;
+  event.command = static_cast<uint8_t>(command);
+  event.text[0] = '\0';
   return true;
 }
 
 // Map HID usage ID + modifiers to a basic ASCII char or control code.
 // Returns 0 if we don't handle that key.
-char btHidKeyToAscii(uint8_t key, uint8_t mods) {
+bool btHidKeyToEvent(uint8_t key, uint8_t mods, BtInputEvent &event) {
+  btMakeEmptyEvent(event, key, mods);
+
   bool shift = (mods & 0x22) != 0;  // left or right shift bits
   bool ctrl = (mods & 0x11) != 0;   // left or right Ctrl bits
 
-
-  // Letters A–Z (usage 0x04–0x1D)
+  // Letters A-Z (usage 0x04-0x1D)
   if (key >= 0x04 && key <= 0x1D) {
     char base = shift ? 'A' : 'a';
-    return base + (key - 0x04);
+    return btSetTextCharEvent(event, base + (key - 0x04));
   }
 
-  char base = 0;
-  char shifted = 0;
+  const char *base = nullptr;
+  const char *shifted = nullptr;
 
   switch (key) {
-    // Number row 1–9, 0
-    case 0x1E:  // '1' / '!'
-      base = '1';
-      shifted = '!';
+    // Number row 1-9, 0
+    case 0x1E:
+      base = "1";
+      shifted = "!";
       break;
 
-    case 0x1F:  // '2' / shift depends on layout
-      base = '2';
-      if (btKeyboardLayout == BT_LAYOUT_UK) {
-        shifted = '"';  // UK: Shift+2 = "
-      } else {
-        shifted = '@';  // US: Shift+2 = @
-      }
+    case 0x1F:
+      base = "2";
+      shifted = (btKeyboardLayout == BT_LAYOUT_UK) ? "\"" : "@";
       break;
 
-    case 0x20:  // '3' / shift depends on layout
-      base = '3';
-      if (btKeyboardLayout == BT_LAYOUT_UK) {
-        shifted = '£';  // UK: Shift+3 = £
-      } else {
-        shifted = '#';  // US: Shift+3 = #
+    case 0x20:
+      if (shift && btKeyboardLayout == BT_LAYOUT_UK) {
+        // M5Stack Font0 follows a CP437-style glyph table: 156 (0x9C) displays as £.
+        return btSetTextByteEvent(event, 156);
       }
+      base = "3";
+      shifted = "#";
       break;
 
     case 0x21:
-      base = '4';
-      shifted = '$';
+      base = "4";
+      shifted = "$";
       break;
     case 0x22:
-      base = '5';
-      shifted = '%';
+      base = "5";
+      shifted = "%";
       break;
     case 0x23:
-      base = '6';
-      shifted = '^';
+      base = "6";
+      shifted = "^";
       break;
     case 0x24:
-      base = '7';
-      shifted = '&';
+      base = "7";
+      shifted = "&";
       break;
     case 0x25:
-      base = '8';
-      shifted = '*';
+      base = "8";
+      shifted = "*";
       break;
     case 0x26:
-      base = '9';
-      shifted = '(';
+      base = "9";
+      shifted = "(";
       break;
     case 0x27:
-      base = '0';
-      shifted = ')';
+      base = "0";
+      shifted = ")";
       break;
 
     // Enter, backspace, tab, space
     case 0x28:
-      base = '\n';
-      shifted = '\n';
-      break;
+      return btSetCommandEvent(event, BT_CMD_ENTER);
 
-    case 0x2A:  // backspace
-      if (ctrl) {
-        // Ctrl+Backspace -> delete previous word (handled as 0x15 in editor)
-        return 0x15;
-      }
-      base = '\b';
-      shifted = '\b';
-      break;
+    case 0x2A:
+      return btSetCommandEvent(event, ctrl ? BT_CMD_DELETE_WORD_BACK : BT_CMD_BACKSPACE);
 
     case 0x2B:
-      base = '\t';
-      shifted = '\t';
-      break;
+      return btSetCommandEvent(event, BT_CMD_TAB);
 
     case 0x2C:
-      base = ' ';
-      shifted = ' ';
+      base = " ";
+      shifted = " ";
       break;
-
 
     // Symbols on main section
     case 0x2D:
-      base = '-';
-      shifted = '_';
+      base = "-";
+      shifted = "_";
       break;
     case 0x2E:
-      base = '=';
-      shifted = '+';
+      base = "=";
+      shifted = "+";
       break;
     case 0x2F:
-      base = '[';
-      shifted = '{';
+      base = "[";
+      shifted = "{";
       break;
     case 0x30:
-      base = ']';
-      shifted = '}';
+      base = "]";
+      shifted = "}";
       break;
     case 0x31:
-      base = '\\';
-      shifted = '|';
+      base = "\\";
+      shifted = "|";
+      break;
+
+    // Non-US / ISO backslash key. Many UK Bluetooth keyboards send this
+    // instead of usage 0x31 for the physical backslash/pipe key.
+    case 0x64:
+      base = "\\";
+      shifted = "|";
       break;
 
     // ISO hash/tilde key (near Enter or left Shift on many UK boards)
     case 0x32:
-      base = '#';
-      shifted = '~';
+      base = "#";
+      shifted = "~";
       break;
 
-    // ; : key
     case 0x33:
-      base = ';';
-      shifted = ':';
+      base = ";";
+      shifted = ":";
       break;
 
-    // Apostrophe / quote key – layout dependent for shifted char
     case 0x34:
-      base = '\'';
-      if (btKeyboardLayout == BT_LAYOUT_UK) {
-        shifted = '@';  // UK: Shift+' = @
-      } else {
-        shifted = '"';  // US: Shift+' = "
-      }
+      base = "'";
+      shifted = (btKeyboardLayout == BT_LAYOUT_UK) ? "@" : "\"";
       break;
 
-    // Backtick / tilde
     case 0x35:
-      base = '`';
-      shifted = '~';
+      base = "`";
+      shifted = "~";
       break;
 
-    // , < . > / ?
     case 0x36:
-      base = ',';
-      shifted = '<';
+      base = ",";
+      shifted = "<";
       break;
     case 0x37:
-      base = '.';
-      shifted = '>';
+      base = ".";
+      shifted = ">";
       break;
     case 0x38:
-      base = '/';
-      shifted = '?';
+      base = "/";
+      shifted = "?";
       break;
 
     default:
       break;
   }
 
-  if (base != 0) {
-    return shift ? shifted : base;
+  if (base) {
+    return btSetTextEvent(event, shift ? shifted : base);
   }
 
   // Dedicated handling for Delete key so Ctrl+Delete can be distinguished
-  if (key == 0x4C) {  // Delete (forward delete)
-    if (ctrl) {
-      // Ctrl+Delete -> delete word forwards (editor sees 0x16)
-      return 0x16;
-    } else {
-      // Plain Delete -> forward-delete single char (editor sees 0x7F)
-      return 0x7F;
-    }
-  }
-
-  if (base != 0) {
-    return shift ? shifted : base;
-  }
-
-  // Dedicated handling for Delete key so Ctrl+Delete can be distinguished
-  if (key == 0x4C) {  // Delete (forward delete)
-    if (ctrl) {
-      // Ctrl+Delete -> delete word forwards (editor sees 0x16)
-      return 0x16;
-    } else {
-      // Plain Delete -> forward-delete single char (editor sees 0x7F)
-      return 0x7F;
-    }
+  if (key == 0x4C) {
+    return btSetCommandEvent(event, ctrl ? BT_CMD_DELETE_WORD_FORWARD : BT_CMD_DELETE_FORWARD);
   }
 
   // Page Up / Page Down / Home / End
-  if (key == 0x4B) {  // Page Up
-    return 0x19;
-  }
-  if (key == 0x4E) {  // Page Down
-    return 0x1A;
-  }
-  if (key == 0x4A) {  // Home
-    if (ctrl) {
-      // Ctrl+Home -> start of document
-      return 0x1D;
-    } else {
-      // Home -> start of visual line
-      return 0x1B;
-    }
-  }
-  if (key == 0x4D) {  // End
-    if (ctrl) {
-      // Ctrl+End -> end of document
-      return 0x1E;
-    } else {
-      // End -> end of visual line
-      return 0x1C;
-    }
+  if (key == 0x4B) return btSetCommandEvent(event, BT_CMD_PAGE_UP);
+  if (key == 0x4E) return btSetCommandEvent(event, BT_CMD_PAGE_DOWN);
+
+  if (key == 0x4A) {
+    return btSetCommandEvent(event, ctrl ? BT_CMD_DOC_HOME : BT_CMD_HOME);
   }
 
-  // Arrow keys -> internal control codes we handle elsewhere
-  // Ctrl+Left / Ctrl+Right give separate codes for word jumps
+  if (key == 0x4D) {
+    return btSetCommandEvent(event, ctrl ? BT_CMD_DOC_END : BT_CMD_END);
+  }
+
+  // Arrow keys -> editor commands. Ctrl+Left / Ctrl+Right move by word.
   if (ctrl) {
     switch (key) {
-      case 0x4F: return 0x18;  // Ctrl+Right -> word right
-      case 0x50:
-        return 0x17;  // Ctrl+Left  -> word left
-                      // Ctrl+Up / Ctrl+Down fall through to normal behaviour
+      case 0x4F: return btSetCommandEvent(event, BT_CMD_WORD_RIGHT);
+      case 0x50: return btSetCommandEvent(event, BT_CMD_WORD_LEFT);
+      default: break;
     }
   }
 
   switch (key) {
-    case 0x4F: return 0x14;  // right
-    case 0x50: return 0x13;  // left
-    case 0x51: return 0x12;  // down
-    case 0x52: return 0x11;  // up
+    case 0x4F: return btSetCommandEvent(event, BT_CMD_RIGHT);
+    case 0x50: return btSetCommandEvent(event, BT_CMD_LEFT);
+    case 0x51: return btSetCommandEvent(event, BT_CMD_DOWN);
+    case 0x52: return btSetCommandEvent(event, BT_CMD_UP);
     default:
-      return 0;
+      return false;
   }
 }
 
 
+// Decode one normalised HID keyboard report into Tiny Journal key events.
+// Normalised report format:
+//   report[0]    = modifiers
+//   report[1..6] = key usages
+//   report[7]    = unused
+void btHandleNormalisedKeyboardReport(const uint8_t report[8]) {
+  uint8_t mods = report[0];
 
-// Notification callback for HID input reports
-void btNotifyCallback(NimBLERemoteCharacteristic *pRemoteCharacteristic,
-                      uint8_t *pData, size_t length, bool isNotify) {
-  // Accept both notifications and indications; just ignore obviously tiny packets
-  if (length < 2) {
-    return;
-  }
-
-  // Count every incoming report
-  btReportCount++;
-
-  // We'll normalise whatever we get into a standard 8-byte "keyboard style" report:
-  //   newReport[0] = modifiers
-  //   newReport[1] = reserved / first key (depending on layout)
-  //   newReport[2..7] = up to 6 keycodes
-  uint8_t newReport[8] = { 0 };
-  uint8_t mods = 0;
-  int keyStart = 2;  // default for classic 8-byte boot reports
-
-  if (length == 8) {
-    // Classic 8-byte boot keyboard report: [mods][reserved][key1..6]
-    size_t copyLen = length;
-    if (copyLen > 8) copyLen = 8;
-    for (size_t i = 0; i < copyLen; ++i) {
-      newReport[i] = pData[i];
-    }
-    mods = newReport[0];
-    keyStart = 2;
-  } else {
-    // Non-standard length (often ReportID + boot layout, or NKRO variants).
-    // Heuristic: skip the first raw byte (likely Report ID), and treat the
-    // following bytes as [mods][reserved/first key][key1..].
-    size_t payloadLen = length - 1;
-    size_t copyLen = payloadLen;
-    if (copyLen > 8) copyLen = 8;
-    for (size_t i = 0; i < copyLen; ++i) {
-      newReport[i] = pData[i + 1];
-    }
-    mods = newReport[0];
-    keyStart = 1;  // keys may begin as early as newReport[1] in this layout
-  }
-
-  // Work out whether any non-modifier key is currently down
   bool anyDown = false;
-  for (int i = keyStart; i < 8; ++i) {
-    if (newReport[i] != 0) {
+  bool sawNewKey = false;
+  bool mappedNewKey = false;
+
+  for (int i = 1; i <= 6; ++i) {
+    if (report[i] != 0) {
       anyDown = true;
       break;
     }
   }
 
-  // For each key that is present in the NEW report but was NOT present
-  // in the LAST report, generate a character and start the repeat timer.
-  for (int i = keyStart; i < 8; ++i) {
-    uint8_t key = newReport[i];
+  // Generate one character/control event for each newly pressed key.
+  for (int i = 1; i <= 6; ++i) {
+    uint8_t key = report[i];
     if (key == 0) continue;
 
     bool alreadyDown = false;
-    for (int j = keyStart; j < 8; ++j) {
+    for (int j = 1; j <= 6; ++j) {
       if (btLastReport[j] == key) {
         alreadyDown = true;
         break;
       }
     }
-    if (alreadyDown) continue;  // still held from previous report
+    if (alreadyDown) continue;
 
-    char c = btHidKeyToAscii(key, mods);
-    if (c != 0) {
-      btQueuePushChar(c);
+    sawNewKey = true;
 
-      // Mark the start of a BT key press for auto-repeat
+    BtInputEvent event;
+    if (btHidKeyToEvent(key, mods, event)) {
+      mappedNewKey = true;
+      btQueuePushEvent(event);
+
       unsigned long now = millis();
       btKeyPressStartTime = now;
       btKeyHeld = false;
+      btRepeatEligible = true;
     }
   }
 
-  // Update "any key down" flag for BT repeat logic
   btAnyKeyDown = anyDown;
+
   if (!btAnyKeyDown) {
     btKeyHeld = false;
+    btRepeatEligible = false;
+  } else if (sawNewKey && !mappedNewKey) {
+    // Important: unmapped keys such as Esc/Caps Lock must not repeat the
+    // previous editor action. This was causing "phantom repeat" behaviour.
+    btKeyHeld = false;
+    btRepeatEligible = false;
   }
 
-  // Remember this report for next time so we can detect newly pressed keys
   for (int i = 0; i < 8; ++i) {
-    btLastReport[i] = newReport[i];
+    btLastReport[i] = report[i];
   }
 }
 
+// Convert a raw BLE HID notification into the normalised Tiny Journal
+// keyboard report format. This deliberately supports the two common shapes:
+//
+//   Standard Report 0x2A4D, Micro Journal-style:
+//     [mods][key1][key2][key3][key4][key5][key6]
+//
+//   Boot Keyboard Input Report 0x2A22:
+//     [mods][reserved][key1][key2][key3][key4][key5][key6]
+//
+// Some keyboards send a Report ID before the standard report:
+//     [reportId][mods][key1][key2][key3][key4][key5][key6]
+bool btNormaliseHidReport(const uint8_t *rawData, uint8_t rawLength, uint8_t outReport[8]) {
+  for (int i = 0; i < 8; ++i) outReport[i] = 0;
+
+  if (!rawData || rawLength < 2) {
+    return false;
+  }
+
+  if (btUsingBootReport) {
+    // Classic boot report: [mods][reserved][key1..6]
+    if (rawLength < 3) return false;
+    outReport[0] = rawData[0];
+    for (int i = 0; i < 6; ++i) {
+      int src = i + 2;
+      if (src < rawLength) outReport[i + 1] = rawData[src];
+    }
+    return true;
+  }
+
+  // Micro Journal-style standard HID report:
+  // [mods][key1][key2][key3][key4][key5][key6]
+  if (rawLength == 7) {
+    outReport[0] = rawData[0];
+    for (int i = 0; i < 6; ++i) {
+      outReport[i + 1] = rawData[i + 1];
+    }
+    return true;
+  }
+
+  // Classic boot-like report:
+  // [mods][reserved][key1][key2][key3][key4][key5][key6]
+  if (rawLength == 8) {
+    outReport[0] = rawData[0];
+    for (int i = 0; i < 6; ++i) {
+      outReport[i + 1] = rawData[i + 2];
+    }
+    return true;
+  }
+
+  // Report-ID-prefixed fallback:
+  // [reportId][mods][key1][key2][key3][key4][key5][key6]
+  if (rawLength >= 8) {
+    outReport[0] = rawData[1];
+    for (int i = 0; i < 6; ++i) {
+      int src = i + 2;
+      if (src < rawLength) outReport[i + 1] = rawData[src];
+    }
+    return true;
+  }
+
+  return false;
+}
 
 
+// Process queued BLE HID reports from the main loop.
+void btProcessHidReports() {
+  if (!btHidReportQueue) return;
 
+  BtHidReport raw;
+  uint8_t normalised[8];
+
+  while (xQueueReceive(btHidReportQueue, &raw, 0) == pdTRUE) {
+    if (btNormaliseHidReport(raw.data, raw.length, normalised)) {
+      btHandleNormalisedKeyboardReport(normalised);
+    }
+  }
+}
+
+// Notification callback for HID input reports.
+// Keep this deliberately small: copy bytes into a FreeRTOS queue, then return.
+// Decoding in the callback is risky because NimBLE callbacks run inside BLE task
+// context, not inside Tiny Journal's normal editor loop.
+void btNotifyCallback(NimBLERemoteCharacteristic *pRemoteCharacteristic,
+                      uint8_t *pData, size_t length, bool isNotify) {
+  if (!pData || length < 2 || !btHidReportQueue) {
+    return;
+  }
+
+  BtHidReport report;
+  report.length = length > 8 ? 8 : length;
+  for (uint8_t i = 0; i < 8; ++i) {
+    report.data[i] = 0;
+  }
+  for (uint8_t i = 0; i < report.length; ++i) {
+    report.data[i] = pData[i];
+  }
+
+  btReportCount++;
+
+  if (xQueueSend(btHidReportQueue, &report, 0) != pdTRUE) {
+    btDroppedReportCount++;
+  }
+}
 
 
 // Scan callback: remember first HID keyboard we see and stop scan
@@ -2093,6 +2672,35 @@ class BtScanCallbacks : public NimBLEScanCallbacks {
 
 // Client callbacks so we can see security / auth status
 class BtClientCallbacks : public NimBLEClientCallbacks {
+  void onConnect(NimBLEClient *pClient) override {
+    btAuthDebug = "connected";
+  }
+
+  void onConnectFail(NimBLEClient *pClient, int reason) override {
+    btAuthDebug = "connectFail=";
+    btAuthDebug += String(reason);
+  }
+
+  void onDisconnect(NimBLEClient *pClient, int reason) override {
+    btAuthDebug = "disc=";
+    btAuthDebug += String(reason);
+  }
+
+  void onPassKeyEntry(NimBLEConnInfo &connInfo) override {
+    // Micro Journal uses this same fallback PIN for keyboards that ask
+    // the central/client to provide a passkey.
+    btAuthDebug = "passkey 123456";
+    NimBLEDevice::injectPassKey(connInfo, 123456);
+  }
+
+  void onConfirmPasskey(NimBLEConnInfo &connInfo, uint32_t pin) override {
+    // Numeric comparison pairing: accept automatically for now.
+    // Later we can show the number on screen if needed.
+    btAuthDebug = "confirm ";
+    btAuthDebug += String(pin);
+    NimBLEDevice::injectConfirmPasskey(connInfo, true);
+  }
+
   void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
     bool enc = connInfo.isEncrypted();
     bool auth = connInfo.isAuthenticated();
@@ -2105,31 +2713,26 @@ class BtClientCallbacks : public NimBLEClientCallbacks {
     btAuthDebug += " bond=";
     btAuthDebug += bond ? "1" : "0";
   }
-
-  void onConnect(NimBLEClient *pClient) override {
-    btAuthDebug = "connected, waiting auth";
-  }
-
-  void onDisconnect(NimBLEClient *pClient, int reason) override {
-    btAuthDebug = "disc=";
-    btAuthDebug += String(reason);
-  }
 };
 
 static BtClientCallbacks btClientCallbacks;
 
 
 void initBluetoothKeyboard() {
+  loadBluetoothKeyboardConfigFromSD();
   if (btInitDone) return;
 
   NimBLEDevice::init("Cardputer Journal");
 
-  // Enable bonding + LE secure connections (Just Works style, no MITM)
-  // bonding = true, mitm = false, sc = true
-  NimBLEDevice::setSecurityAuth(true, false, true);
+  if (!btHidReportQueue) {
+    btHidReportQueue = xQueueCreate(BT_HID_REPORT_QUEUE_SIZE, sizeof(BtHidReport));
+  }
 
-  // (Optional, defaults are already "no input/output"):
-  // NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+  // Match Micro Journal's BLE keyboard security approach:
+  // bonding + MITM + LE Secure Connections.
+  // This is important because some BLE keyboards will bond/encrypt but still
+  // not send input reports unless the pairing is authenticated.
+  NimBLEDevice::setSecurityAuth(true, true, true);
 
   btInitDone = true;
 }
@@ -2145,6 +2748,7 @@ void btKeyboardStartScan() {
   btKeyboardReportChar = nullptr;
   btKeyboardLastError = "";
   btKeyboardName = "";
+  btKeyboardAddress = "";
   btScanDeviceCount = 0;
   btSetupState = BT_STATE_SCANNING;
 
@@ -2167,26 +2771,37 @@ void btKeyboardStartScan() {
 
   const NimBLEUUID hidUuid((uint16_t)0x1812);
   const NimBLEAdvertisedDevice *found = nullptr;
+  const NimBLEAdvertisedDevice *savedMatch = nullptr;
 
   for (int i = 0; i < count && btScanDeviceCount < BT_MAX_SCAN_DEVICES; ++i) {
     const NimBLEAdvertisedDevice *dev = results.getDevice(i);
     if (!dev) continue;
 
     bool isHid = dev->isAdvertisingService(hidUuid);
+    String address = dev->getAddress().toString().c_str();
     String name = dev->getName().c_str();
     if (name.length() == 0) {
       // Fall back to MAC address if the device has no name
-      name = dev->getAddress().toString().c_str();
+      name = address;
     }
 
     btScanDeviceNames[btScanDeviceCount] = name;
     btScanDeviceIsHid[btScanDeviceCount] = isHid;
     btScanDeviceCount++;
 
-    // Remember the first HID device we see for auto-connect
+    // Prefer the previously paired keyboard if it appears in the scan results.
+    if (isHid && btKeyboardSavedAddress.length() > 0 && address.equalsIgnoreCase(btKeyboardSavedAddress)) {
+      savedMatch = dev;
+    }
+
+    // Remember the first HID device as a fallback.
     if (!found && isHid) {
       found = dev;
     }
+  }
+
+  if (savedMatch) {
+    found = savedMatch;
   }
 
   if (!found) {
@@ -2199,6 +2814,7 @@ void btKeyboardStartScan() {
 
   btKeyboardAdvDevice = (NimBLEAdvertisedDevice *)found;
   btKeyboardName = found->getName().c_str();
+  btKeyboardAddress = found->getAddress().toString().c_str();
 
   if (btKeyboardConnect()) {
     String msg = "BT keyboard: ";
@@ -2216,9 +2832,6 @@ void btKeyboardStartScan() {
 }
 
 
-
-
-
 // Connect to the last advertised HID keyboard, subscribe to reports
 bool btKeyboardConnect() {
   if (!btKeyboardAdvDevice) {
@@ -2229,9 +2842,14 @@ bool btKeyboardConnect() {
 
   btKeyboardClient = NimBLEDevice::createClient();
   btKeyboardClient->setClientCallbacks(&btClientCallbacks, false);
+  btKeyboardClient->setConnectionParams(12, 12, 0, 51);
+  btKeyboardClient->setConnectTimeout(5000);
 
   // Reset debug counters for this connection attempt
   btReportCount = 0;
+  btDroppedReportCount = 0;
+  btSubscribedReportCount = 0;
+  btReportDebug = "";
   btAuthDebug = "";
 
   if (!btKeyboardClient->connect(btKeyboardAdvDevice)) {
@@ -2241,9 +2859,20 @@ bool btKeyboardConnect() {
     return false;
   }
 
-  // Run the security / bonding handshake (required by many keyboards)
+  // Run the security / bonding handshake (required by many keyboards).
   if (!btKeyboardClient->secureConnection()) {
     btKeyboardLastError = "Secure connect failed";
+    btKeyboardClient->disconnect();
+    btKeyboardClient = nullptr;
+    btSetupState = BT_STATE_IDLE;
+    return false;
+  }
+
+  // Force service/characteristic discovery before selecting the report
+  // characteristic. Micro Journal does this explicitly, and it helps avoid
+  // connecting successfully but never receiving HID reports.
+  if (!btKeyboardClient->discoverAttributes()) {
+    btKeyboardLastError = "Discover failed";
     btKeyboardClient->disconnect();
     btKeyboardClient = nullptr;
     btSetupState = BT_STATE_IDLE;
@@ -2259,61 +2888,85 @@ bool btKeyboardConnect() {
     return false;
   }
 
-  NimBLERemoteCharacteristic *reportChar = nullptr;
+  NimBLERemoteCharacteristic *primaryReportChar = nullptr;
+  btUsingBootReport = false;
 
-  // 1) Try the standard HID Report characteristic first (0x2A4D)
-  NimBLERemoteCharacteristic *stdReport =
-    hidService->getCharacteristic(NimBLEUUID((uint16_t)0x2A4D));
-  if (stdReport && (stdReport->canNotify() || stdReport->canIndicate())) {
-    reportChar = stdReport;
+  // Start fresh for this connection.
+  if (btHidReportQueue) {
+    xQueueReset(btHidReportQueue);
   }
-
-  // 2) Try Boot Keyboard Input Report (0x2A22), used by many keyboards
-  if (!reportChar) {
-    NimBLERemoteCharacteristic *bootReport =
-      hidService->getCharacteristic(NimBLEUUID((uint16_t)0x2A22));
-    if (bootReport && (bootReport->canNotify() || bootReport->canIndicate())) {
-      reportChar = bootReport;
-    }
+  for (int i = 0; i < 8; ++i) {
+    btLastReport[i] = 0;
   }
+  btAnyKeyDown = false;
+  btKeyHeld = false;
+  btRepeatEligible = false;
+  btClearInputEventQueue();
 
-  // 3) Fallback: pick the first characteristic in the HID service that can notify or indicate
-  if (!reportChar) {
-    const std::vector<NimBLERemoteCharacteristic *> &chars = hidService->getCharacteristics(true);
-    for (auto *chr : chars) {
-      if (chr && (chr->canNotify() || chr->canIndicate())) {
-        reportChar = chr;
-        break;
-      }
-    }
-  }
+  // Prefer the same path as Micro Journal: HID Report characteristic 0x2A4D.
+  // Important: some keyboards expose more than one 0x2A4D report characteristic.
+  // getCharacteristic() may return the wrong one, so subscribe to every notifiable
+  // 0x2A4D characteristic we find.
+  uint8_t subscriptions = 0;
+  const NimBLEUUID reportUuid((uint16_t)0x2A4D);
+  const NimBLEUUID bootKeyboardUuid((uint16_t)0x2A22);
 
-  if (!reportChar) {
-    btKeyboardLastError = "No notifiable report";
-    btKeyboardClient->disconnect();
-    btKeyboardClient = nullptr;
-    btSetupState = BT_STATE_IDLE;
-    return false;
-  }
+  const std::vector<NimBLERemoteCharacteristic *> &chars = hidService->getCharacteristics(true);
 
-  btKeyboardReportChar = reportChar;
-
-  // Subscribe to all notifiable / indicatable characteristics in the HID service.
-  // Some keyboards use a different report characteristic for key input, so we
-  // just listen to everything that can notify/indicate.
-  int subs = 0;
-  const std::vector<NimBLERemoteCharacteristic *> &allChars = hidService->getCharacteristics(true);
-  for (auto *chr : allChars) {
+  for (auto *chr : chars) {
     if (!chr) continue;
+    if (!chr->getUUID().equals(reportUuid)) continue;
     if (!(chr->canNotify() || chr->canIndicate())) continue;
 
     bool notify = chr->canNotify();
     if (chr->subscribe(notify, btNotifyCallback)) {
-      subs++;
+      if (!primaryReportChar) primaryReportChar = chr;
+      subscriptions++;
     }
   }
 
-  if (subs == 0) {
+  // Fallback: Boot Keyboard Input Report 0x2A22.
+  // If we use this, request Boot Protocol via Protocol Mode 0x2A4E first.
+  if (subscriptions == 0) {
+    NimBLERemoteCharacteristic *protocolMode =
+      hidService->getCharacteristic(NimBLEUUID((uint16_t)0x2A4E));
+    if (protocolMode && protocolMode->canWrite()) {
+      uint8_t bootMode = 0x00;  // 0 = Boot Protocol, 1 = Report Protocol
+      protocolMode->writeValue(&bootMode, 1, true);
+    }
+
+    for (auto *chr : chars) {
+      if (!chr) continue;
+      if (!chr->getUUID().equals(bootKeyboardUuid)) continue;
+      if (!(chr->canNotify() || chr->canIndicate())) continue;
+
+      bool notify = chr->canNotify();
+      if (chr->subscribe(notify, btNotifyCallback)) {
+        if (!primaryReportChar) primaryReportChar = chr;
+        subscriptions++;
+        btUsingBootReport = true;
+      }
+    }
+  }
+
+  // Last-resort fallback: subscribe to the first notifiable HID characteristic.
+  // This is not ideal, but it gives us a way to test keyboards that do not expose
+  // the expected 0x2A4D/0x2A22 path.
+  if (subscriptions == 0) {
+    for (auto *chr : chars) {
+      if (chr && (chr->canNotify() || chr->canIndicate())) {
+        bool notify = chr->canNotify();
+        if (chr->subscribe(notify, btNotifyCallback)) {
+          primaryReportChar = chr;
+          subscriptions++;
+          btUsingBootReport = false;
+          break;
+        }
+      }
+    }
+  }
+
+  if (subscriptions == 0 || !primaryReportChar) {
     btKeyboardLastError = "Subscribe failed";
     btKeyboardClient->disconnect();
     btKeyboardClient = nullptr;
@@ -2322,14 +2975,23 @@ bool btKeyboardConnect() {
     return false;
   }
 
+  btKeyboardReportChar = primaryReportChar;
+  btSubscribedReportCount = subscriptions;
+  btReportDebug = "subs=";
+  btReportDebug += String(subscriptions);
+  btReportDebug += btUsingBootReport ? " boot" : " report";
+
   btKeyboardConnected = true;
   btKeyboardLastError = "";
+  if (btKeyboardAddress.length() > 0) {
+    btKeyboardSavedAddress = btKeyboardAddress;
+    btKeyboardSavedName = btKeyboardName;
+    saveBluetoothKeyboardConfigToSD();
+  }
   btSetupState = BT_STATE_CONNECTED;
   btKeyboardEnabled = true;
   return true;
 }
-
-
 
 
 void btKeyboardDisconnect() {
@@ -2345,11 +3007,19 @@ void btKeyboardDisconnect() {
   btKeyboardEnabled = false;
   btSetupState = BT_STATE_IDLE;
 
-  // Clear BT repeat state
+  // Clear BT repeat state and queued reports
   btAnyKeyDown = false;
   btKeyHeld = false;
+  btRepeatEligible = false;
+  btUsingBootReport = false;
+  btClearInputEventQueue();
+  for (int i = 0; i < 8; ++i) {
+    btLastReport[i] = 0;
+  }
+  if (btHidReportQueue) {
+    xQueueReset(btHidReportQueue);
+  }
 }
-
 
 
 // Poll the BLE stack for connection progress. Call frequently from loop().
@@ -2365,7 +3035,7 @@ void btKeyboardPollConnection() {
   }
 }
 
-// Consume characters from the BT queue and feed them into the app
+// Consume text/command events from the BT queue and feed them into the app
 void handleBluetoothInput() {
   if (!btKeyboardEnabled) {
     return;
@@ -2377,10 +3047,12 @@ void handleBluetoothInput() {
     return;
   }
 
-  char c;
+  btProcessHidReports();
+
+  BtInputEvent event;
   bool any = false;
 
-  while (btQueuePopChar(c)) {
+  while (btQueuePopEvent(event)) {
     any = true;
 
     unsigned long now = millis();
@@ -2388,78 +3060,131 @@ void handleBluetoothInput() {
     savedAfterIdle = false;
 
     if (appMode == MODE_EDITOR) {
-      if (c == '\b') {
-        backspaceChar();
-        setLastAction(ACTION_BACKSPACE, 0);
-      } else if (c == '\n') {
-        insertNewline();
-        setLastAction(ACTION_INSERT_CHAR, '\n');
-      } else if (c == '\t') {
-        insertTab();
-        setLastAction(ACTION_INSERT_CHAR, '\t');
-      } else if (c == 0x11) {  // up arrow
-        moveCursorUp();
-        setLastAction(ACTION_MOVE_UP, 0);
-      } else if (c == 0x12) {  // down arrow
-        moveCursorDown();
-        setLastAction(ACTION_MOVE_DOWN, 0);
-      } else if (c == 0x13) {  // left arrow
-        moveCursorLeft();
-        setLastAction(ACTION_MOVE_LEFT, 0);
-      } else if (c == 0x14) {  // right arrow
-        moveCursorRight();
-        setLastAction(ACTION_MOVE_RIGHT, 0);
-      } else if (c == 0x15) {  // Ctrl+Backspace: delete previous word
-        deleteWordBackwards();
-        setLastAction(ACTION_DELETE_WORD_BACK, 0);
-      } else if (c == 0x16) {  // Ctrl+Delete: delete next word
-        deleteWordForwards();
-        setLastAction(ACTION_DELETE_WORD_FORWARD, 0);
-      } else if (c == 0x17) {  // Ctrl+Left: move by word left
-        moveCursorWordLeft();
-        setLastAction(ACTION_WORD_LEFT, 0);
-      } else if (c == 0x18) {  // Ctrl+Right: move by word right
-        moveCursorWordRight();
-        setLastAction(ACTION_WORD_RIGHT, 0);
-      } else if (c == 0x19) {  // Page Up
-        scrollPageUp();
-        setLastAction(ACTION_PAGE_UP, 0);
-      } else if (c == 0x1A) {  // Page Down
-        scrollPageDown();
-        setLastAction(ACTION_PAGE_DOWN, 0);
-      } else if (c == 0x1B) {  // Home: start of visual line
-        moveCursorHome();
-        setLastAction(ACTION_HOME, 0);
-      } else if (c == 0x1C) {  // End: end of visual line
-        moveCursorEnd();
-        setLastAction(ACTION_END, 0);
-      } else if (c == 0x1D) {  // Ctrl+Home: start of document
-        moveCursorDocHome();
-        setLastAction(ACTION_DOC_HOME, 0);
-      } else if (c == 0x1E) {  // Ctrl+End: end of document
-        moveCursorDocEnd();
-        setLastAction(ACTION_DOC_END, 0);
-      } else if (c == 0x7F) {  // Delete key: forward-delete char
-        deleteForwardChar();
-        setLastAction(ACTION_DELETE_FORWARD, 0);
-      } else {
-        insertChar(c);
-        setLastAction(ACTION_INSERT_CHAR, c);
+      if (event.type == BT_EVENT_TEXT) {
+        size_t len = strlen(event.text);
+        insertText(event.text);
+
+        if (len == 1) {
+          setLastAction(ACTION_INSERT_CHAR, event.text[0]);
+        } else {
+          // Multi-byte text cannot be represented by the
+          // old single-char repeat system. Insert it once and disable repeat.
+          setLastAction(ACTION_NONE, 0);
+          btRepeatEligible = false;
+        }
+      } else if (event.type == BT_EVENT_COMMAND) {
+        switch (event.command) {
+          case BT_CMD_BACKSPACE:
+            backspaceChar();
+            setLastAction(ACTION_BACKSPACE, 0);
+            break;
+
+          case BT_CMD_ENTER:
+            insertNewline();
+            setLastAction(ACTION_INSERT_CHAR, '\n');
+            break;
+
+          case BT_CMD_TAB:
+            insertTab();
+            setLastAction(ACTION_INSERT_CHAR, '\t');
+            break;
+
+          case BT_CMD_UP:
+            moveCursorUp();
+            setLastAction(ACTION_MOVE_UP, 0);
+            break;
+
+          case BT_CMD_DOWN:
+            moveCursorDown();
+            setLastAction(ACTION_MOVE_DOWN, 0);
+            break;
+
+          case BT_CMD_LEFT:
+            moveCursorLeft();
+            setLastAction(ACTION_MOVE_LEFT, 0);
+            break;
+
+          case BT_CMD_RIGHT:
+            moveCursorRight();
+            setLastAction(ACTION_MOVE_RIGHT, 0);
+            break;
+
+          case BT_CMD_DELETE_WORD_BACK:
+            deleteWordBackwards();
+            setLastAction(ACTION_DELETE_WORD_BACK, 0);
+            break;
+
+          case BT_CMD_DELETE_WORD_FORWARD:
+            deleteWordForwards();
+            setLastAction(ACTION_DELETE_WORD_FORWARD, 0);
+            break;
+
+          case BT_CMD_WORD_LEFT:
+            moveCursorWordLeft();
+            setLastAction(ACTION_WORD_LEFT, 0);
+            break;
+
+          case BT_CMD_WORD_RIGHT:
+            moveCursorWordRight();
+            setLastAction(ACTION_WORD_RIGHT, 0);
+            break;
+
+          case BT_CMD_PAGE_UP:
+            scrollPageUp();
+            setLastAction(ACTION_PAGE_UP, 0);
+            break;
+
+          case BT_CMD_PAGE_DOWN:
+            scrollPageDown();
+            setLastAction(ACTION_PAGE_DOWN, 0);
+            break;
+
+          case BT_CMD_HOME:
+            moveCursorHome();
+            setLastAction(ACTION_HOME, 0);
+            break;
+
+          case BT_CMD_END:
+            moveCursorEnd();
+            setLastAction(ACTION_END, 0);
+            break;
+
+          case BT_CMD_DOC_HOME:
+            moveCursorDocHome();
+            setLastAction(ACTION_DOC_HOME, 0);
+            break;
+
+          case BT_CMD_DOC_END:
+            moveCursorDocEnd();
+            setLastAction(ACTION_DOC_END, 0);
+            break;
+
+          case BT_CMD_DELETE_FORWARD:
+            deleteForwardChar();
+            setLastAction(ACTION_DELETE_FORWARD, 0);
+            break;
+
+          default:
+            break;
+        }
       }
+
       needsRedraw = true;
 
     } else if (appMode == MODE_MENU) {
       // Basic menu navigation with BT keyboard
-      if (c == '\n') {
-        menuSelect();
-      } else if (c == '\b') {
-        menuBack();
-      } else if (c == 0x11) {
-        menuMoveUp();
-        needsRedraw = true;
-      } else if (c == 0x12) {
-        menuMoveDown();
-        needsRedraw = true;
+      if (event.type == BT_EVENT_COMMAND) {
+        if (event.command == BT_CMD_ENTER) {
+          menuSelect();
+        } else if (event.command == BT_CMD_BACKSPACE) {
+          menuBack();
+        } else if (event.command == BT_CMD_UP) {
+          menuMoveUp();
+          needsRedraw = true;
+        } else if (event.command == BT_CMD_DOWN) {
+          menuMoveDown();
+          needsRedraw = true;
+        }
       }
     }
   }
@@ -2492,6 +3217,17 @@ void handleBluetoothKeyboardSetupKeys(const Keyboard_Class::KeysState &ks) {
     return;
   }
 
+  // Opt+Enter forgets the saved keyboard and clears BLE bond records.
+  if (ks.opt && ks.enter) {
+    if (btKeyboardConnected || (btKeyboardClient && btKeyboardClient->isConnected())) {
+      btKeyboardDisconnect();
+    }
+    forgetBluetoothKeyboardConfig();
+    showStatusMessage("BT keyboard + bond forgotten", 2200);
+    needsRedraw = true;
+    return;
+  }
+
   // Opt key: toggle layout (US <-> UK)
   if (ks.opt) {
     if (btKeyboardLayout == BT_LAYOUT_US) {
@@ -2501,10 +3237,10 @@ void handleBluetoothKeyboardSetupKeys(const Keyboard_Class::KeysState &ks) {
       btKeyboardLayout = BT_LAYOUT_US;
       showStatusMessage("BT layout: US", 1500);
     }
+    saveBluetoothKeyboardConfigToSD();
     needsRedraw = true;
     return;
   }
-
 
 
   // Connected: Enter disconnects
@@ -2550,9 +3286,15 @@ void handleBluetoothKeyboardSetupKeys(const Keyboard_Class::KeysState &ks) {
 
 void drawBluetoothKeyboardSetup() {
   M5Cardputer.Display.startWrite();
-  M5Cardputer.Display.fillScreen(BLACK);
 
   int screenW = M5Cardputer.Display.width();
+  bool fullClear = (lastRenderedAppMode != MODE_MENU || lastRenderedMenu != currentMenu);
+  if (fullClear) {
+    M5Cardputer.Display.fillScreen(BLACK);
+  }
+  lastRenderedAppMode = MODE_MENU;
+  lastRenderedMenu = currentMenu;
+
   int startY = topBarHeight;
 
   String title = "Bluetooth keyboard";
@@ -2597,6 +3339,15 @@ void drawBluetoothKeyboardSetup() {
     M5Cardputer.Display.print("Reports: " + String(btReportCount));
     y += lineHeight;
 
+    // Report subscription debug
+    M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, editorBgColor);
+    M5Cardputer.Display.setCursor(3, y);
+    String reportLabel = btReportDebug.length() ? btReportDebug : "subs=0";
+    reportLabel += " drop=";
+    reportLabel += String(btDroppedReportCount);
+    M5Cardputer.Display.print(reportLabel);
+    y += lineHeight;
+
     // Layout info
     M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, editorBgColor);
     M5Cardputer.Display.setCursor(3, y);
@@ -2606,10 +3357,27 @@ void drawBluetoothKeyboardSetup() {
     M5Cardputer.Display.print(layoutLabel);
     y += lineHeight;
 
+    // Saved keyboard info
+    M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, editorBgColor);
+    M5Cardputer.Display.setCursor(3, y);
+    if (btKeyboardSavedAddress.length()) {
+      String savedLabel = "Saved: ";
+      savedLabel += btKeyboardSavedName.length() ? btKeyboardSavedName : btKeyboardSavedAddress;
+      M5Cardputer.Display.print(savedLabel);
+    } else {
+      M5Cardputer.Display.print("Saved: none");
+    }
+    y += lineHeight;
+
     // Hint for controls
     M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, editorBgColor);
     M5Cardputer.Display.setCursor(3, y);
-    M5Cardputer.Display.print("Enter: disconnect   Back: exit");
+    M5Cardputer.Display.print("Enter: disconnect Back: exit");
+    y += lineHeight;
+
+    M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, editorBgColor);
+    M5Cardputer.Display.setCursor(3, y);
+    M5Cardputer.Display.print("Opt+Enter: forget keyboard");
     y += lineHeight;
 
   } else if (btSetupState == BT_STATE_SCANNING) {
@@ -2659,11 +3427,18 @@ void drawBluetoothKeyboardSetup() {
           row += " [HID]";
         }
         M5Cardputer.Display.print(row);
-
-        M5Cardputer.Display.print(row);
         y += lineHeight;
       }
     }
+
+    // Report subscription debug
+    M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, editorBgColor);
+    M5Cardputer.Display.setCursor(3, y);
+    String reportLabel = btReportDebug.length() ? btReportDebug : "subs=0";
+    reportLabel += " drop=";
+    reportLabel += String(btDroppedReportCount);
+    M5Cardputer.Display.print(reportLabel);
+    y += lineHeight;
 
     // Layout info
     M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, editorBgColor);
@@ -2678,6 +3453,11 @@ void drawBluetoothKeyboardSetup() {
     M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, editorBgColor);
     M5Cardputer.Display.setCursor(3, y);
     M5Cardputer.Display.print("Enter: scan & pair   Back: exit");
+    y += lineHeight;
+
+    M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, editorBgColor);
+    M5Cardputer.Display.setCursor(3, y);
+    M5Cardputer.Display.print("Opt+Enter: forget keyboard");
     y += lineHeight;
   }
 
@@ -2728,7 +3508,12 @@ void openWiFiSetup() {
   wifiPasswordInput = "";
 
   M5Cardputer.Display.startWrite();
-  M5Cardputer.Display.fillScreen(BLACK);
+  bool menuFullClear = (lastRenderedAppMode != MODE_MENU || lastRenderedMenu != currentMenu);
+  if (menuFullClear) {
+    M5Cardputer.Display.fillScreen(BLACK);
+  }
+  lastRenderedAppMode = MODE_MENU;
+  lastRenderedMenu = currentMenu;
   int screenW = M5Cardputer.Display.width();
   int textY = (topBarHeight - lineHeight) / 2;
   if (textY < 0) textY = 0;
@@ -2884,126 +3669,111 @@ static void writeWavHeader(File &file, uint32_t sampleRate, uint32_t totalSample
 }
 
 
+void startAudioNote() {
+  // Open-ended blocking audio note recorder.
+  //
+  // Important build note:
+  // M5Stack ESP32 board package 3.2.2 is required for working Cardputer mic capture
+  // in Arduino IDE on this hardware/library combination. Later 3.3.x builds can
+  // produce valid-length silent WAV files or constant bogus sample values.
 
-
-void startAudioNoteStub() {
-  // Simple blocking audio note recorder.
-  // Creates /journal/audio/YYYY-MM-DD_HHMM.wav and records until ESC is pressed.
+  if (!SD.exists("/journal/audio")) {
+    SD.mkdir("/journal/audio");
+  }
 
   String dateStr = getCurrentDateString();  // e.g. 2025-11-29
-  String timeStr = getCurrentTimeString();  // e.g. 184259 (HHMMSS, colon-free)
+  String timeStr = getCurrentTimeString();  // e.g. 184259
   String baseName = dateStr + "_" + timeStr;
   String fileName = baseName + ".wav";
   String path = String("/journal/audio/") + fileName;
 
-  // Ensure we don't overwrite an existing file; add _1, _2, ... suffix if needed
+  // Ensure we don't overwrite an existing file; add _1, _2, ... suffix if needed.
   int suffix = 1;
   while (SD.exists(path.c_str()) && suffix < 100) {
-    fileName = baseName + "_" + String(suffix);
+    fileName = baseName + "_" + String(suffix) + ".wav";
     path = String("/journal/audio/") + fileName;
     suffix++;
   }
 
-  File audioFile = SD.open(path, FILE_WRITE);
+  File audioFile = SD.open(path.c_str(), FILE_WRITE);
   if (!audioFile) {
     showStatusMessage("Audio: can't open file", 2000);
     return;
   }
 
-
-  // Reserve space for WAV header; we'll patch it at the end.
   uint8_t blankHeader[44] = { 0 };
   audioFile.write(blankHeader, sizeof(blankHeader));
 
-  // Make sure speaker is off while using the mic (just in case).
-  if (M5Cardputer.Speaker.isEnabled()) {
-    M5Cardputer.Speaker.end();
-  }
-
-  if (!M5Cardputer.Mic.isEnabled()) {
-    M5Cardputer.Mic.begin();
-  }
-
   const uint32_t sampleRate = 17000;
-  const size_t BUF_SAMPLES = 512;
-  static int16_t sampleBuf[BUF_SAMPLES];
-  uint32_t totalSamples = 0;
+  const size_t chunkSamples = 256;
 
-  // Draw simple recording UI
+  int16_t sampleBuf[chunkSamples];
+  uint32_t samplesWritten = 0;
+  const int warmupChunksToDiscard = 8;  // discard initial mic/I2S settling click
+  int warmupChunksDiscarded = 0;
+  unsigned long startedMs = millis();
+  unsigned long lastScreenUpdateMs = 0;
+
   M5Cardputer.Display.fillScreen(editorBgColor);
   M5Cardputer.Display.setTextColor(editorFgColor, editorBgColor);
   M5Cardputer.Display.setCursor(0, 0);
   M5Cardputer.Display.print("Recording audio note");
-
   M5Cardputer.Display.setCursor(0, lineHeight * 2);
-  M5Cardputer.Display.print("File: ");
   M5Cardputer.Display.print(fileName);
+  M5Cardputer.Display.setCursor(0, lineHeight * 4);
+  M5Cardputer.Display.print("Press any key to stop");
 
+  // The Cardputer mic and speaker cannot be used at the same time.
+  M5Cardputer.Speaker.end();
+  delay(50);
+  M5Cardputer.Mic.begin();
 
-  int infoY = M5Cardputer.Display.height() - lineHeight * 2;
-  if (infoY < lineHeight * 4) infoY = lineHeight * 4;
-  M5Cardputer.Display.setCursor(0, infoY);
-  M5Cardputer.Display.print("ESC: stop recording");
-
-  unsigned long startMs = millis();
-  unsigned long lastUiUpdate = 0;
-  bool recording = true;
-
-  while (recording) {
+  while (true) {
     M5Cardputer.update();
-    updateRTC();
 
-    // Stop on ESC (Fn+`) or raw ` key.
-    if (M5Cardputer.Keyboard.isKeyPressed('`')) {
-      recording = false;
+    // Ignore the keypress that opened the recorder; after that, any key stops.
+    if ((millis() - startedMs) > 500 &&
+        M5Cardputer.Keyboard.isChange() &&
+        M5Cardputer.Keyboard.isPressed()) {
+      break;
     }
-#ifdef KEY_ESC
-    if (M5Cardputer.Keyboard.isKeyPressed(KEY_ESC)) {
-      recording = false;
-    }
-#endif
 
-
-    if (M5Cardputer.Mic.isEnabled()) {
-      if (M5Cardputer.Mic.record(sampleBuf, BUF_SAMPLES, sampleRate)) {
-        audioFile.write((uint8_t *)sampleBuf, BUF_SAMPLES * sizeof(int16_t));
-        totalSamples += BUF_SAMPLES;
+    if (M5Cardputer.Mic.record(sampleBuf, chunkSamples, sampleRate)) {
+      if (warmupChunksDiscarded < warmupChunksToDiscard) {
+        warmupChunksDiscarded++;
+      } else {
+        audioFile.write((uint8_t *)sampleBuf, chunkSamples * sizeof(int16_t));
+        samplesWritten += chunkSamples;
       }
     }
 
     unsigned long now = millis();
-    if (now - lastUiUpdate > 200) {
-      lastUiUpdate = now;
-
-      unsigned long elapsedMs = now - startMs;
-      unsigned long seconds = elapsedMs / 1000UL;
-      unsigned long minutes = seconds / 60UL;
-      seconds %= 60UL;
-
-      char timeBuf[16];
-      snprintf(timeBuf, sizeof(timeBuf), "%02lu:%02lu",
-               (unsigned long)minutes, (unsigned long)seconds);
-
-      int y = lineHeight * 4;
+    if (now - lastScreenUpdateMs >= 500) {
+      lastScreenUpdateMs = now;
+      unsigned long elapsedSec = (now - startedMs) / 1000;
       int screenW = M5Cardputer.Display.width();
-      M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, BLACK);
-      M5Cardputer.Display.setCursor(0, y);
-      M5Cardputer.Display.print("Elapsed: ");
-      M5Cardputer.Display.print(timeBuf);
+
+      M5Cardputer.Display.fillRect(0, lineHeight * 6, screenW, lineHeight * 2, editorBgColor);
+      M5Cardputer.Display.setCursor(0, lineHeight * 6);
+      M5Cardputer.Display.print("Time: ");
+      M5Cardputer.Display.print(elapsedSec);
+      M5Cardputer.Display.print("s");
     }
 
-    delay(5);
+    delay(1);
   }
 
-  audioFile.flush();
-  writeWavHeader(audioFile, sampleRate, totalSamples);
+  M5Cardputer.Mic.end();
+  delay(50);
+  M5Cardputer.Speaker.begin();
+
+  writeWavHeader(audioFile, sampleRate, samplesWritten);
   audioFile.close();
 
-  // Mic is left initialised; fine for now.
   showStatusMessage("Saved audio: " + fileName, 2000);
+
   needsRedraw = true;
 }
-
 void drawAudioNotesList(AudioNoteEntry *entries, int count, int selectedIndex, int scrollOffset) {
   M5Cardputer.Display.fillScreen(editorBgColor);
   M5Cardputer.Display.setTextColor(editorFgColor, editorBgColor);
@@ -3037,19 +3807,9 @@ void drawAudioNotesList(AudioNoteEntry *entries, int count, int selectedIndex, i
       baseName = baseName.substring(slashPos + 1);
     }
 
-    // File name on left
+    // File name
     M5Cardputer.Display.setCursor(0, y);
     M5Cardputer.Display.print(baseName);
-
-    // Size on the right-ish
-    uint32_t kb = entries[idx].size / 1024;
-    char sizeBuf[16];
-    snprintf(sizeBuf, sizeof(sizeBuf), "%luKB", (unsigned long)kb);
-
-    int sizeX = screenW - 64;  // simple fixed column near right edge
-    if (sizeX < 0) sizeX = 0;
-    M5Cardputer.Display.setCursor(sizeX, y);
-    M5Cardputer.Display.print(sizeBuf);
   }
 
   // Footer instructions
@@ -3282,15 +4042,6 @@ void drawDocumentList(DocumentEntry *entries, int count, int selectedIndex, int 
 
     M5Cardputer.Display.setCursor(0, y);
     M5Cardputer.Display.print(name);
-
-    uint32_t kb = entries[idx].size / 1024;
-    char sizeBuf[16];
-    snprintf(sizeBuf, sizeof(sizeBuf), "%luKB", (unsigned long)kb);
-
-    int sizeX = screenW - 64;  // fixed column near right edge
-    if (sizeX < 0) sizeX = 0;
-    M5Cardputer.Display.setCursor(sizeX, y);
-    M5Cardputer.Display.print(sizeBuf);
   }
 
   M5Cardputer.Display.setTextColor(editorFgColor, editorBgColor);
@@ -3457,7 +4208,6 @@ void openDocumentBrowser() {
   }
 
   // Collect .txt files from the main journal dirs
-  collectDocsFromDir("/journal", entries, count, MAX_DOCUMENTS);
   collectDocsFromDir("/journal/daily", entries, count, MAX_DOCUMENTS);
   collectDocsFromDir("/journal/notes", entries, count, MAX_DOCUMENTS);
   collectDocsFromDir("/journal/meetings", entries, count, MAX_DOCUMENTS);
@@ -3502,6 +4252,7 @@ void openDocumentBrowser() {
       // Open on ENTER
       if (ks.enter && count > 0) {
         currentFilePath = entries[selectedIndex].path;
+        saveLastEditedFilePath();
         appMode = MODE_EDITOR;
         currentMenu = MENU_NONE;
 
@@ -3623,7 +4374,7 @@ static unsigned long getFolderSize(const char *dirPath, unsigned long &fileCount
 }
 
 // Delete .txt files in a folder.
-// If excludeSystem is true, rtc.txt and config-readme.txt are NOT deleted.
+// If excludeSystem is true, config/readme files are NOT deleted. Root docs are no longer used.
 static unsigned long deleteTxtInDir(const char *dirPath, bool excludeSystem) {
   unsigned long deleted = 0;
   File dir = SD.open(dirPath);
@@ -3783,9 +4534,10 @@ void showJournalStorageSummary() {
 
   unsigned long filesRoot = 0, filesDaily = 0, filesNotes = 0, filesMeet = 0;
   unsigned long filesProj = 0, filesTravel = 0, filesMisc = 0, filesArch = 0;
-  unsigned long filesAudio = 0, filesAudioExport = 0;
+  unsigned long filesAudio = 0, filesAudioExport = 0, filesConfig = 0;
 
   unsigned long bytesRoot = getFolderSize("/journal", filesRoot);
+  unsigned long bytesConfig = getFolderSize("/journal/config", filesConfig);
   unsigned long bytesDaily = getFolderSize("/journal/daily", filesDaily);
   unsigned long bytesNotes = getFolderSize("/journal/notes", filesNotes);
   unsigned long bytesMeet = getFolderSize("/journal/meetings", filesMeet);
@@ -3796,8 +4548,8 @@ void showJournalStorageSummary() {
   unsigned long bytesAudio = getFolderSize("/journal/audio", filesAudio);
   unsigned long bytesAudioExport = getFolderSize("/journal/audio/export", filesAudioExport);
 
-  unsigned long totalBytes = bytesRoot + bytesDaily + bytesNotes + bytesMeet + bytesProj + bytesTravel + bytesMisc + bytesArch + bytesAudio + bytesAudioExport;
-  unsigned long totalFiles = filesRoot + filesDaily + filesNotes + filesMeet + filesProj + filesTravel + filesMisc + filesArch + filesAudio + filesAudioExport;
+  unsigned long totalBytes = bytesRoot + bytesConfig + bytesDaily + bytesNotes + bytesMeet + bytesProj + bytesTravel + bytesMisc + bytesArch + bytesAudio + bytesAudioExport;
+  unsigned long totalFiles = filesRoot + filesConfig + filesDaily + filesNotes + filesMeet + filesProj + filesTravel + filesMisc + filesArch + filesAudio + filesAudioExport;
 
   unsigned long audioBytes = bytesAudio + bytesAudioExport;
   unsigned long audioFiles = filesAudio + filesAudioExport;
@@ -3874,7 +4626,6 @@ void deleteAllJournalDocuments() {
   }
 
   unsigned long deleted = 0;
-  deleted += deleteTxtInDir("/journal", true);  // keep rtc.txt, CONFIG-README.txt
   deleted += deleteTxtInDir("/journal/daily", false);
   deleted += deleteTxtInDir("/journal/notes", false);
   deleted += deleteTxtInDir("/journal/meetings", false);
@@ -4030,7 +4781,7 @@ void runFactoryReset() {
 
 
   // Rebuild journal structure and default config/template files
-  ensureJournalDirs();       // recreates /journal tree + wifi/gdrive/README
+  ensureJournalDirs();       // recreates /journal tree + /journal/config files/README
   ensureDefaultTemplates();  // recreates template .tpl files
   loadTemplates();           // refresh in-memory template list
 
@@ -4043,6 +4794,229 @@ void runFactoryReset() {
 }
 
 
+// ---------- USB mass storage mode ----------
+
+static int32_t usbMscRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
+  if (bufsize == 0 || offset >= USB_MSC_BLOCK_SIZE) {
+    return -1;
+  }
+
+  uint8_t *dst = (uint8_t *)buffer;
+  uint8_t sectorBuf[USB_MSC_BLOCK_SIZE];
+  uint32_t remaining = bufsize;
+  uint32_t currentLba = lba;
+  uint32_t currentOffset = offset;
+
+  while (remaining > 0) {
+    uint32_t chunk = USB_MSC_BLOCK_SIZE - currentOffset;
+    if (chunk > remaining) chunk = remaining;
+
+    if (currentOffset == 0 && chunk == USB_MSC_BLOCK_SIZE) {
+      if (!SD.readRAW(dst, currentLba)) {
+        return -1;
+      }
+    } else {
+      if (!SD.readRAW(sectorBuf, currentLba)) {
+        return -1;
+      }
+      memcpy(dst, sectorBuf + currentOffset, chunk);
+    }
+
+    dst += chunk;
+    remaining -= chunk;
+    currentLba++;
+    currentOffset = 0;
+  }
+
+  return (int32_t)bufsize;
+}
+
+static int32_t usbMscWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
+  if (bufsize == 0 || offset >= USB_MSC_BLOCK_SIZE) {
+    return -1;
+  }
+
+  uint8_t sectorBuf[USB_MSC_BLOCK_SIZE];
+  uint32_t remaining = bufsize;
+  uint32_t currentLba = lba;
+  uint32_t currentOffset = offset;
+  uint8_t *src = buffer;
+
+  while (remaining > 0) {
+    uint32_t chunk = USB_MSC_BLOCK_SIZE - currentOffset;
+    if (chunk > remaining) chunk = remaining;
+
+    if (currentOffset == 0 && chunk == USB_MSC_BLOCK_SIZE) {
+      if (!SD.writeRAW(src, currentLba)) {
+        return -1;
+      }
+    } else {
+      if (!SD.readRAW(sectorBuf, currentLba)) {
+        return -1;
+      }
+      memcpy(sectorBuf + currentOffset, src, chunk);
+      if (!SD.writeRAW(sectorBuf, currentLba)) {
+        return -1;
+      }
+    }
+
+    src += chunk;
+    remaining -= chunk;
+    currentLba++;
+    currentOffset = 0;
+  }
+
+  return (int32_t)bufsize;
+}
+
+static bool usbMscStartStop(uint8_t power_condition, bool start, bool load_eject) {
+  (void)power_condition;
+  (void)start;
+  (void)load_eject;
+  return true;
+}
+
+
+void initUsbStorageDevice(bool presentOnStart) {
+#if defined(ARDUINO_USB_MODE) && (ARDUINO_USB_MODE == 0)
+  if (usbMscConfigured) {
+    return;
+  }
+
+  if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
+    return;
+  }
+
+  usbMscBlockCount = SD.numSectors();
+  if (usbMscBlockCount == 0) {
+    return;
+  }
+
+  // Create the USB MSC object only inside the dedicated storage boot mode.
+  // Normal Tiny Journal mode keeps ownership of the SD card.
+  if (usbMsc == nullptr) {
+    usbMsc = new USBMSC();
+  }
+  if (usbMsc == nullptr) {
+    return;
+  }
+
+  usbMsc->vendorID("TinyJ");
+  usbMsc->productID("Journal SD");
+  usbMsc->productRevision("1.0");
+  usbMsc->onRead(usbMscRead);
+  usbMsc->onWrite(usbMscWrite);
+  usbMsc->onStartStop(usbMscStartStop);
+  usbMsc->mediaPresent(presentOnStart);
+
+  usbMscConfigured = usbMsc->begin(usbMscBlockCount, USB_MSC_BLOCK_SIZE);
+  if (usbMscConfigured) {
+    USB.begin();
+  }
+#endif
+}
+
+void drawUsbStorageModeScreen() {
+  M5Cardputer.Display.fillScreen(BLACK);
+  M5Cardputer.Display.setFont(&fonts::Font0);
+  M5Cardputer.Display.setTextSize(2);
+  M5Cardputer.Display.setTextColor(editorFgColor, editorBgColor);
+
+  int y = 14;
+  const int lineStep = 24;
+
+  M5Cardputer.Display.setCursor(8, y);
+  M5Cardputer.Display.println("Switch power");
+  y += lineStep;
+  M5Cardputer.Display.setCursor(8, y);
+  M5Cardputer.Display.println("off then");
+  y += lineStep;
+  M5Cardputer.Display.setCursor(8, y);
+  M5Cardputer.Display.println("connect over");
+  y += lineStep;
+  M5Cardputer.Display.setCursor(8, y);
+  M5Cardputer.Display.println("USB.");
+
+  M5Cardputer.Display.setTextSize(1);
+}
+
+void enterUsbStorageMode() {
+#if !defined(ARDUINO_USB_MODE) || (ARDUINO_USB_MODE == 1)
+  showStatusMessage("Set USB Mode: USB-OTG", 3000);
+  needsRedraw = true;
+  return;
+#else
+  if (bufferDirty) {
+    saveToFile();
+    bufferDirty = false;
+    savedAfterIdle = true;
+  }
+
+  ensureJournalDirs();
+
+  File flag = SD.open(USB_STORAGE_FLAG_PATH, FILE_WRITE);
+  if (!flag) {
+    showStatusMessage("USB flag write failed", 3000);
+    needsRedraw = true;
+    return;
+  }
+  flag.println("1");
+  flag.close();
+
+  M5Cardputer.Display.fillScreen(BLACK);
+  M5Cardputer.Display.setFont(&fonts::Font0);
+  M5Cardputer.Display.setTextSize(2);
+  M5Cardputer.Display.setTextColor(editorFgColor, editorBgColor);
+  M5Cardputer.Display.setCursor(8, 32);
+  M5Cardputer.Display.println("Restarting");
+  M5Cardputer.Display.setCursor(8, 56);
+  M5Cardputer.Display.println("USB mode...");
+
+  delay(600);
+  ESP.restart();
+#endif
+}
+
+void runUsbStorageBootMode() {
+#if !defined(ARDUINO_USB_MODE) || (ARDUINO_USB_MODE == 1)
+  SD.remove(USB_STORAGE_FLAG_PATH);
+  return;
+#else
+  drawUsbStorageModeScreen();
+
+  initUsbStorageDevice(true);
+  if (!usbMscConfigured || usbMscBlockCount == 0) {
+    M5Cardputer.Display.setTextSize(1);
+    M5Cardputer.Display.setCursor(8, 120);
+    M5Cardputer.Display.println("USB MSC failed.");
+    delay(2500);
+    SD.remove(USB_STORAGE_FLAG_PATH);
+    ESP.restart();
+  }
+
+  // Dedicated USB storage mode: do not start the editor, BLE, Wi-Fi, autosave, or other SD writers.
+  // Eject/unmount from the computer first, then press any Cardputer key to leave this mode.
+  while (true) {
+    M5Cardputer.update();
+    if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+      break;
+    }
+    delay(20);
+  }
+
+  usbMsc->mediaPresent(false);
+  SD.remove(USB_STORAGE_FLAG_PATH);
+
+  M5Cardputer.Display.fillScreen(BLACK);
+  M5Cardputer.Display.setTextSize(2);
+  M5Cardputer.Display.setCursor(8, 44);
+  M5Cardputer.Display.println("Restarting");
+  M5Cardputer.Display.setCursor(8, 68);
+  M5Cardputer.Display.println("normal mode...");
+  delay(600);
+  ESP.restart();
+#endif
+}
 
 
 // ---------- Global menu opener ----------
@@ -4134,7 +5108,7 @@ void handleKeyboard() {
   }
 
   if (optDown && tabDown) {
-    startAudioNoteStub();
+    startAudioNote();
     return;
   }
 
@@ -4284,12 +5258,83 @@ void handleKeyboard() {
   }
 }
 
+
+// ---------- UTF-8 helpers ----------
+
+bool utf8IsContinuationByte(uint8_t b) {
+  return (b & 0xC0) == 0x80;
+}
+
+size_t utf8CharLenAt(size_t idx) {
+  size_t len = (size_t)textBuffer.length();
+  if (idx >= len) return 0;
+
+  uint8_t c = (uint8_t)textBuffer[idx];
+  if (c < 0x80) return 1;
+  if ((c & 0xE0) == 0xC0 && idx + 1 < len) return 2;
+  if ((c & 0xF0) == 0xE0 && idx + 2 < len) return 3;
+  if ((c & 0xF8) == 0xF0 && idx + 3 < len) return 4;
+
+  // Invalid/truncated UTF-8: treat as one byte so we always advance.
+  return 1;
+}
+
+size_t utf8NextIndex(size_t idx) {
+  size_t len = (size_t)textBuffer.length();
+  if (idx >= len) return len;
+  size_t step = utf8CharLenAt(idx);
+  if (step < 1) step = 1;
+  idx += step;
+  if (idx > len) idx = len;
+  return idx;
+}
+
+size_t utf8PrevIndex(size_t idx) {
+  size_t len = (size_t)textBuffer.length();
+  if (idx > len) idx = len;
+  if (idx == 0) return 0;
+
+  idx--;
+  while (idx > 0 && utf8IsContinuationByte((uint8_t)textBuffer[idx])) {
+    idx--;
+  }
+  return idx;
+}
+
+String utf8CharStringAt(size_t idx) {
+  size_t len = (size_t)textBuffer.length();
+  if (idx >= len) return String("");
+  size_t charLen = utf8CharLenAt(idx);
+  if (charLen < 1) charLen = 1;
+  if (idx + charLen > len) charLen = len - idx;
+  return textBuffer.substring(idx, idx + charLen);
+}
+
+int visualColsAt(size_t idx, int currentCol) {
+  if (idx >= (size_t)textBuffer.length()) return 0;
+  char c = textBuffer[idx];
+  if (c == '\t') {
+    int remaining = TAB_SIZE - (currentCol % TAB_SIZE);
+    if (remaining <= 0) remaining = TAB_SIZE;
+    return remaining;
+  }
+  return 1;
+}
+
 // ---------- Editing primitives ----------
 
 void insertChar(char c) {
+  char text[2] = { c, '\0' };
+  insertText(text);
+}
+
+void insertText(const char *text) {
+  if (!text || text[0] == '\0') return;
+
   cursorIndex = clampCursorIndex(cursorIndex);
-  textBuffer = textBuffer.substring(0, cursorIndex) + c + textBuffer.substring(cursorIndex);
-  cursorIndex++;
+  String insertValue = String(text);
+  textBuffer = textBuffer.substring(0, cursorIndex) + insertValue + textBuffer.substring(cursorIndex);
+  cursorIndex += insertValue.length();
   bufferDirty = true;
   rebuildLayout();
   ensureCursorVisible();
@@ -4308,8 +5353,9 @@ void backspaceChar() {
   cursorIndex = clampCursorIndex(cursorIndex);
   if (cursorIndex == 0) return;
 
-  textBuffer.remove(cursorIndex - 1, 1);
-  cursorIndex--;
+  size_t prevIndex = utf8PrevIndex(cursorIndex);
+  textBuffer.remove(prevIndex, cursorIndex - prevIndex);
+  cursorIndex = prevIndex;
   bufferDirty = true;
   rebuildLayout();
   ensureCursorVisible();
@@ -4320,7 +5366,8 @@ void deleteForwardChar() {
   cursorIndex = clampCursorIndex(cursorIndex);
   if (cursorIndex >= (size_t)textBuffer.length()) return;
 
-  textBuffer.remove(cursorIndex, 1);
+  size_t nextIndex = utf8NextIndex(cursorIndex);
+  textBuffer.remove(cursorIndex, nextIndex - cursorIndex);
   bufferDirty = true;
   rebuildLayout();
   ensureCursorVisible();
@@ -4383,7 +5430,7 @@ void deleteWordForwards() {
 void moveCursorLeft() {
   cursorIndex = clampCursorIndex(cursorIndex);
   if (cursorIndex > 0) {
-    cursorIndex--;
+    cursorIndex = utf8PrevIndex(cursorIndex);
   }
   int line, col;
   computeCursorLineCol(line, col);
@@ -4395,7 +5442,7 @@ void moveCursorLeft() {
 void moveCursorRight() {
   cursorIndex = clampCursorIndex(cursorIndex);
   if (cursorIndex < (size_t)textBuffer.length()) {
-    cursorIndex++;
+    cursorIndex = utf8NextIndex(cursorIndex);
   }
   int line, col;
   computeCursorLineCol(line, col);
@@ -4630,34 +5677,54 @@ void rebuildLayout() {
       continue;
     }
 
-    int charCols = 1;
-
-    if (c == '\t') {
-      int remaining = TAB_SIZE - (col % TAB_SIZE);
-      if (remaining <= 0) remaining = TAB_SIZE;
-      charCols = remaining;
-    }
+    size_t charLen = utf8CharLenAt(index);
+    if (charLen < 1) charLen = 1;
+    int charCols = visualColsAt(index, col);
+    if (charCols < 1) charCols = 1;
 
     if (c == ' ') {
       lastSpaceIdx = index;
     }
 
     if (col + charCols > maxCols) {
+      // If a single character expands wider than the available line width
+      // (for example a tab while maxCols is very small), force it onto its
+      // own line and advance. Without this, cataracts mode can loop forever.
+      if (col == 0 && charCols > maxCols) {
+        size_t nextIndex = index + charLen;
+        if (nextIndex > n) nextIndex = n;
+        pushLine(index, nextIndex);
+        index = nextIndex;
+        lineStart = index;
+        col = 0;
+        lastSpaceIdx = (size_t)-1;
+        continue;
+      }
+
       if (lastSpaceIdx != (size_t)-1 && lastSpaceIdx >= lineStart) {
         pushLine(lineStart, lastSpaceIdx);
         index = lastSpaceIdx + 1;
         lineStart = index;
       } else {
-        pushLine(lineStart, index);
-        lineStart = index;
+        if (index == lineStart) {
+          // Safety valve: never push an empty line without advancing.
+          size_t nextIndex = index + charLen;
+          if (nextIndex > n) nextIndex = n;
+          pushLine(index, nextIndex);
+          index = nextIndex;
+          lineStart = index;
+        } else {
+          pushLine(lineStart, index);
+          lineStart = index;
+        }
       }
       col = 0;
       lastSpaceIdx = (size_t)-1;
       continue;
-    } else {
-      col += charCols;
-      index++;
     }
+
+    col += charCols;
+    index += charLen;
   }
 
   if (lineStart <= n) {
@@ -4695,6 +5762,16 @@ void computeCursorLineCol(int &outLine, int &outCol) {
       return;
     }
     if (cursorIndex <= vl.end) {
+      // When the cursor is exactly on a soft-wrap boundary, prefer the next
+      // visual line. Otherwise the cursor can sit at col == maxCols, off the
+      // right edge, which is especially obvious in cataracts mode.
+      bool atSoftWrapBoundary = (cursorIndex == vl.end &&
+                                 i + 1 < lineCount &&
+                                 visualLines[i + 1].start == cursorIndex);
+      if (atSoftWrapBoundary) {
+        continue;
+      }
+
       outLine = i;
       int col = 0;
       for (size_t idx = vl.start; idx < cursorIndex && idx < vl.end; ++idx) {
@@ -4780,6 +5857,24 @@ void ensureCursorVisible() {
 
   int totalLines = (int)visualLines.size();
 
+  if (editorFontSizeIndex == 2) {
+    // Cataracts mode uses a simple two-row writing viewport. Ignore the normal
+    // anchored/classic cursor preference so newly wrapped text remains visible.
+    if (line < firstVisibleLine) {
+      firstVisibleLine = line;
+    } else if (line >= firstVisibleLine + visibleLines) {
+      firstVisibleLine = line - visibleLines + 1;
+    }
+
+    if (firstVisibleLine < 0) firstVisibleLine = 0;
+    int maxFirst = totalLines - visibleLines;
+    if (maxFirst < 0) maxFirst = 0;
+    if (firstVisibleLine > maxFirst) firstVisibleLine = maxFirst;
+
+    preferredCol = col;
+    return;
+  }
+
   if (cursorAnchored) {
     int anchorRow = (visibleLines * 2) / 3;
     if (anchorRow < 0) anchorRow = 0;
@@ -4818,6 +5913,11 @@ size_t clampCursorIndex(size_t idx) {
   size_t len = (size_t)textBuffer.length();
   if (len == 0) return 0;
   if (idx > len) return len;
+
+  // Never leave the cursor inside a UTF-8 continuation byte.
+  while (idx > 0 && idx < len && utf8IsContinuationByte((uint8_t)textBuffer[idx])) {
+    idx--;
+  }
   return idx;
 }
 
@@ -4959,10 +6059,11 @@ void handleBtKeyRepeat() {
 
   if (!btKeyboardEnabled || !btKeyboardConnected) {
     btKeyHeld = false;
+    btRepeatEligible = false;
     return;
   }
 
-  if (!btAnyKeyDown) {
+  if (!btAnyKeyDown || !btRepeatEligible) {
     btKeyHeld = false;
     return;
   }
@@ -4989,7 +6090,7 @@ void handleBtKeyRepeat() {
 int getMenuItemCount(MenuId menu) {
   switch (menu) {
     case MENU_MAIN:
-      return 3;
+      return 4;
     case MENU_WRITING:
       return 2;
     case MENU_TEXTDOCS:
@@ -5021,6 +6122,7 @@ String getMenuItemLabel(MenuId menu, int index) {
         case 0: return "Return to editor";
         case 1: return "Writing menu";
         case 2: return "Settings";
+        case 3: return "Enter USB storage mode";
       }
       break;
 
@@ -5122,10 +6224,6 @@ String getMenuItemLabel(MenuId menu, int index) {
       break;
 
 
-
-
-
-
     case MENU_SETTINGS_SYNC:
       switch (index) {
         case 0: return "Sync now";
@@ -5171,7 +6269,6 @@ MenuId getMenuParent(MenuId menu) {
     default: return MENU_NONE;
   }
 }
-
 
 
 void openMenu(MenuId menu) {
@@ -5235,6 +6332,9 @@ void menuSelect() {
         case 2:
           openMenu(MENU_SETTINGS);
           break;
+        case 3:
+          enterUsbStorageMode();
+          break;
       }
       break;
 
@@ -5263,8 +6363,6 @@ void menuSelect() {
         case 3:
           openDocumentBrowser();
           break;
-
-          break;
       }
       break;
 
@@ -5281,7 +6379,7 @@ void menuSelect() {
     case MENU_AUDIO:
       switch (menuSelectedIndex) {
         case 0:
-          startAudioNoteStub();
+          startAudioNote();
           break;
         case 1:
           startAudioNoteBrowser();
@@ -5326,7 +6424,7 @@ void menuSelect() {
           break;
         case 3:
           ensureJournalDirs();
-          showStatusMessage("Folders/config checked", 2000);
+          showStatusMessage("Folders/config rebuilt", 2000);
           break;
         case 4:
           runFactoryReset();
@@ -5416,8 +6514,6 @@ void menuSelect() {
           }
       }
       break;
-
-
 
 
     case MENU_SETTINGS_SYNC:
@@ -5534,7 +6630,12 @@ void handleAboutScreenKeys(const Keyboard_Class::KeysState &ks) {
 
 void drawDateTimeEditor() {
   M5Cardputer.Display.startWrite();
-  M5Cardputer.Display.fillScreen(BLACK);
+  bool menuFullClear = (lastRenderedAppMode != MODE_MENU || lastRenderedMenu != currentMenu);
+  if (menuFullClear) {
+    M5Cardputer.Display.fillScreen(BLACK);
+  }
+  lastRenderedAppMode = MODE_MENU;
+  lastRenderedMenu = currentMenu;
 
   int screenW = M5Cardputer.Display.width();
 
@@ -5609,7 +6710,12 @@ void drawDateTimeEditor() {
 
 void drawAboutScreen() {
   M5Cardputer.Display.startWrite();
-  M5Cardputer.Display.fillScreen(BLACK);
+  bool menuFullClear = (lastRenderedAppMode != MODE_MENU || lastRenderedMenu != currentMenu);
+  if (menuFullClear) {
+    M5Cardputer.Display.fillScreen(BLACK);
+  }
+  lastRenderedAppMode = MODE_MENU;
+  lastRenderedMenu = currentMenu;
 
   int screenW = M5Cardputer.Display.width();
 
@@ -5629,7 +6735,7 @@ void drawAboutScreen() {
 
   // Intro
   M5Cardputer.Display.setCursor(3, y);
-  M5Cardputer.Display.print("Tiny Journal 2025.12.1");
+  M5Cardputer.Display.print("Tiny Journal 2026.06.06");
   y += lineHeight;
 
   M5Cardputer.Display.setCursor(3, y);
@@ -5707,7 +6813,12 @@ void showStatusMessage(const String &msg, unsigned long durationMs) {
 
 void drawWiFiSetup() {
   M5Cardputer.Display.startWrite();
-  M5Cardputer.Display.fillScreen(BLACK);
+  bool menuFullClear = (lastRenderedAppMode != MODE_MENU || lastRenderedMenu != currentMenu);
+  if (menuFullClear) {
+    M5Cardputer.Display.fillScreen(BLACK);
+  }
+  lastRenderedAppMode = MODE_MENU;
+  lastRenderedMenu = currentMenu;
 
   int screenW = M5Cardputer.Display.width();
   int startY = topBarHeight;
@@ -5794,11 +6905,11 @@ void drawWiFiSetup() {
     M5Cardputer.Display.print("Enter: connect  Back: clear/exit");
   }
 
+  int footerY = M5Cardputer.Display.height() - lineHeight;
+  M5Cardputer.Display.fillRect(0, footerY, screenW, lineHeight, editorBgColor);
   if (statusMessageUntil > millis() && statusMessage.length() > 0) {
-    int y = M5Cardputer.Display.height() - lineHeight;
-    M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, editorBgColor);
     M5Cardputer.Display.setTextColor(editorFgColor, editorBgColor);
-    M5Cardputer.Display.setCursor(0, y);
+    M5Cardputer.Display.setCursor(0, footerY);
     M5Cardputer.Display.print(statusMessage);
   }
 
@@ -5809,8 +6920,18 @@ void drawWiFiSetup() {
 
 void drawEditor() {
   M5Cardputer.Display.startWrite();
-  M5Cardputer.Display.fillScreen(BLACK);
 
+  bool editorFullClear = (lastRenderedAppMode != MODE_EDITOR);
+  if (editorFullClear) {
+    M5Cardputer.Display.fillScreen(BLACK);
+  }
+
+  lastRenderedAppMode = MODE_EDITOR;
+  lastRenderedMenu = MENU_NONE;
+  // Do not clear the whole screen on every editor redraw.
+  // The top bar and each visible editor row are cleared/repainted below.
+  // A full clear is only used when returning from menus/special screens,
+  // which prevents leftover UI fragments without bringing back typing flicker.
   int screenW = M5Cardputer.Display.width();
 
   // Always use "small" text settings for status / word count bars
@@ -5819,7 +6940,7 @@ void drawEditor() {
   // ----- Word count + saved status (top bar, unchanged size) -----
   size_t wordCount = 0;
   bool inWord = false;
-  for (size_t i = 0; i < (size_t)textBuffer.length(); ++i) {
+  for (size_t i = 0; i < (size_t)textBuffer.length(); ) {
     char c = textBuffer[i];
     if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
       if (inWord) {
@@ -5829,6 +6950,7 @@ void drawEditor() {
     } else {
       inWord = true;
     }
+    i = utf8NextIndex(i);
   }
   if (inWord) wordCount++;
 
@@ -5836,6 +6958,7 @@ void drawEditor() {
 
   char savedChar = bufferDirty ? 'x' : 'o';
   String savedStr = String("saved:") + savedChar;
+  String batteryStr = getBatteryStatusString();
 
   // Top bar background
   M5Cardputer.Display.fillRect(0, 0, screenW, topBarHeight, WHITE);
@@ -5847,6 +6970,12 @@ void drawEditor() {
   M5Cardputer.Display.setCursor(3, textY);
   M5Cardputer.Display.print(countStr);
 
+  int batteryWidth = M5Cardputer.Display.textWidth(batteryStr);
+  int batteryX = (screenW - batteryWidth) / 2;
+  if (batteryX < 0) batteryX = 0;
+  M5Cardputer.Display.setCursor(batteryX, textY);
+  M5Cardputer.Display.print(batteryStr);
+
   int savedWidth = M5Cardputer.Display.textWidth(savedStr);
   int savedX = screenW - savedWidth - 3;
   if (savedX < 0) savedX = 0;
@@ -5856,31 +6985,17 @@ void drawEditor() {
   // ----- Editor text (scaled font) -----
   int scale;
   if (editorFontSizeIndex == 0) {
-    // Standard
     scale = 1;
   } else if (editorFontSizeIndex == 1) {
-    // Large
     scale = 2;
   } else {
-    // Cataracts mode: choose the largest scale that keeps one giant character visible.
-    int screenH = M5Cardputer.Display.height();
-    int editorHeight = screenH - topBarHeight;
-    if (editorHeight < baseLineHeight) editorHeight = baseLineHeight;
-
-    int maxScaleY = editorHeight / baseLineHeight;
-    int maxScaleX = screenW / baseCharWidth;
-    if (maxScaleX < 1) maxScaleX = 1;
-    if (maxScaleY < 1) maxScaleY = 1;
-
-    // Use the limiting dimension so the character fits on screen.
-    scale = (maxScaleY < maxScaleX) ? maxScaleY : maxScaleX;
-    if (scale < 1) scale = 1;
+    scale = CATARACTS_TEXT_SCALE;
   }
 
   int charWidth = baseCharWidth * scale;
   int editorLineH = baseLineHeight * scale;
   if (charWidth < 1) charWidth = 1;
-  if (editorLineH < 1) editorLineH = lineHeight;  // sensible fallback
+  if (editorLineH < 1) editorLineH = lineHeight;
 
   M5Cardputer.Display.setTextSize(scale);
   M5Cardputer.Display.setTextColor(editorFgColor, editorBgColor);
@@ -5894,7 +7009,6 @@ void drawEditor() {
     int lineIndex = firstVisibleLine + row;
     int y = startY + row * editorLineH;
 
-    // Clear the line background in editor colours
     M5Cardputer.Display.fillRect(0, y, screenW, editorLineH, editorBgColor);
 
     if (lineIndex < 0 || lineIndex >= (int)visualLines.size()) {
@@ -5907,42 +7021,30 @@ void drawEditor() {
 
     while (idx < vl.end) {
       char c = textBuffer[idx];
-      int charCols = 1;
+      int charCols = visualColsAt(idx, col);
+      if (charCols < 1) charCols = 1;
 
       if (c == '\t') {
-        int remaining = TAB_SIZE - (col % TAB_SIZE);
-        if (remaining <= 0) remaining = TAB_SIZE;
-        charCols = remaining;
-      }
-
-      int repeats = (c == '\t') ? charCols : 1;
-      char drawChar = (c == '\t') ? ' ' : c;
-
-      for (int r = 0; r < repeats; ++r) {
+        for (int r = 0; r < charCols; ++r) {
+          bool isCursorHere = (lineIndex == cursorLine && col == cursorCol);
+          M5Cardputer.Display.setTextColor(isCursorHere ? editorBgColor : editorFgColor,
+                                           isCursorHere ? editorFgColor : editorBgColor);
+          M5Cardputer.Display.setCursor(col * charWidth, y);
+          M5Cardputer.Display.print(' ');
+          col++;
+          if (col >= maxCols) break;
+        }
+      } else {
         bool isCursorHere = (lineIndex == cursorLine && col == cursorCol);
-
-        if (isCursorHere) {
-          M5Cardputer.Display.setTextColor(editorBgColor, editorFgColor);
-        } else {
-          M5Cardputer.Display.setTextColor(editorFgColor, editorBgColor);
-        }
-
-        int charX = col * charWidth;
-        M5Cardputer.Display.setCursor(charX, y);
-        M5Cardputer.Display.print(drawChar);
-
-        col++;
-
-        if (col >= maxCols) {
-          break;
-        }
+        M5Cardputer.Display.setTextColor(isCursorHere ? editorBgColor : editorFgColor,
+                                         isCursorHere ? editorFgColor : editorBgColor);
+        M5Cardputer.Display.setCursor(col * charWidth, y);
+        M5Cardputer.Display.print(utf8CharStringAt(idx));
+        col += charCols;
       }
 
-      if (col >= maxCols) {
-        break;
-      }
-
-      idx++;
+      if (col >= maxCols) break;
+      idx = utf8NextIndex(idx);
     }
 
     // Draw cursor block if it's beyond the last character on this visual line
@@ -5988,7 +7090,12 @@ void drawMenu() {
 
 
   M5Cardputer.Display.startWrite();
-  M5Cardputer.Display.fillScreen(BLACK);
+  bool menuFullClear = (lastRenderedAppMode != MODE_MENU || lastRenderedMenu != currentMenu);
+  if (menuFullClear) {
+    M5Cardputer.Display.fillScreen(BLACK);
+  }
+  lastRenderedAppMode = MODE_MENU;
+  lastRenderedMenu = currentMenu;
 
   int screenW = M5Cardputer.Display.width();
 
@@ -6046,11 +7153,11 @@ void drawMenu() {
     M5Cardputer.Display.print(label);
   }
 
+  int footerY = M5Cardputer.Display.height() - lineHeight;
+  M5Cardputer.Display.fillRect(0, footerY, screenW, lineHeight, editorBgColor);
   if (statusMessageUntil > millis() && statusMessage.length() > 0) {
-    int y = M5Cardputer.Display.height() - lineHeight;
-    M5Cardputer.Display.fillRect(0, y, screenW, lineHeight, editorBgColor);
     M5Cardputer.Display.setTextColor(editorFgColor, editorBgColor);
-    M5Cardputer.Display.setCursor(0, y);
+    M5Cardputer.Display.setCursor(0, footerY);
     M5Cardputer.Display.print(statusMessage);
   }
 
